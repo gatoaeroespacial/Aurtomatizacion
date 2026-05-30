@@ -1,0 +1,151 @@
+INFORME DE AVANCES
+Sistema Adaptativo de Recomendación Musical
+basado en Bioseñales (GSR, ECG/HRV y Respiración)
+para la Mejora de la Concentración en Tareas Cognitivas
+
+
+
+
+1. Identificación del Proyecto
+1.1 Nombre del proyecto
+Sistema adaptativo de recomendación musical basado en bioseñales (GSR, ECG/HRV y respiración) para la mejora de la concentración en tareas cognitivas.
+1.2 Descripción general
+El proyecto propone desarrollar un sistema automatizado que monitorea en tiempo real las señales fisiológicas de un usuario mediante el hardware MySignals HW v2 de Libelium, e infiere su nivel de concentración para generar y adaptar dinámicamente una lista de reproducción musical orientada a optimizar su estado cognitivo. El sistema se fundamenta en la relación establecida en la literatura científica entre bioseñales periféricas, estado cognitivo y efecto de la música sobre el sistema nervioso autónomo.
+1.3 Pregunta de investigación
+¿Cómo puede un sistema automatizado basado en bioseñales periféricas (GSR, ECG/HRV y respiración) generar y adaptar dinámicamente listas de reproducción musical para mejorar el nivel de concentración de los usuarios durante la realización de tareas cognitivas?
+1.4 Justificación resumida
+La disminución progresiva de los niveles de atención sostenida en contextos académicos y laborales, asociada a la sobreexposición a estímulos digitales y la sobrecarga cognitiva, representa una problemática relevante. La música ha demostrado ser un modulador efectivo del estado cognitivo y fisiológico, mientras que las bioseñales periféricas —GSR, ECG/HRV y respiración— permiten inferir el nivel de concentración de forma no intrusiva. Sin embargo, la mayoría de los estudios actuales abordan estas variables de forma separada o estática, sin implementar mecanismos de retroalimentación en tiempo real. Este proyecto cierra esa brecha desarrollando un sistema integrado, adaptativo y personalizado.
+
+2. Objetivos del Proyecto
+2.1 Objetivo general
+Desarrollar un sistema automatizado basado en bioseñales periféricas (GSR, ECG/HRV y respiración) que genere y adapte dinámicamente listas de reproducción musical para mejorar el nivel de concentración de los usuarios durante la realización de tareas cognitivas.
+2.2 Objetivos específicos
+Configurar y validar la captura de señales fisiológicas (GSR, ECG y respiración) mediante el dispositivo MySignals HW v2 de Libelium, asegurando la correcta adquisición y transmisión de datos en tiempo real.
+Identificar y extraer características relevantes de las bioseñales capturadas —como conductancia de la piel, métricas HRV (RMSSD, SDNN) y frecuencia respiratoria— que permitan inferir el estado de concentración del usuario, fundamentándose en la literatura científica revisada.
+Diseñar e implementar un clasificador adaptativo de estado cognitivo que combine reglas heurísticas calibradas con literatura y un modelo de aprendizaje automático (Random Forest) que se reentrena de forma continua con los datos personales del usuario.
+Desarrollar un motor de recomendación musical adaptativo que, basándose en el estado cognitivo detectado y el historial de efectividad de canciones para ese usuario, seleccione y controle automáticamente la reproducción musical.
+Evaluar la efectividad del sistema midiendo la evolución del estado de concentración de los usuarios durante sesiones de uso, y ajustar el modelo de recomendación en función de los resultados observados.
+
+3. Estado Actual del Proyecto
+3.1 Resumen ejecutivo del avance
+A la fecha, se ha completado exitosamente la configuración del hardware, la implementación del sistema de captura de señales, el desarrollo de la base del aplicativo de monitoreo y la construcción del núcleo del sistema de recomendación musical adaptativa. La base del sistema está funcional: los tres sensores registran valores coherentes en tiempo real, el procesamiento de señales extrae features fisiológicas relevantes según la literatura, el clasificador opera con reglas heurísticas calibradas científicamente y el motor musical ya selecciona y reproduce canciones en función del estado detectado.
+
+
+3.2 Logros concretos alcanzados
+Hardware y adquisición de datos
+Identificación y corrección de la librería correcta: se descartó la librería eHealth v2 (incompatible) y se instaló con éxito la librería oficial MySignals de Libelium, resolviendo múltiples errores de compilación relacionados con compatibilidad con compiladores AVR-GCC modernos.
+Software y procesamiento
+Dashboard de monitoreo en Python completamente funcional con tres gráficas en tiempo real (GSR, ECG, Airflow), cálculo de BPM, frecuencia respiratoria e indicador de estado cognitivo.
+Guardado automático de sesiones en formato CSV con timestamp real y marca de tiempo relativa del sensor.
+Clasificador adaptativo (classifier.py) que opera con heurística en las primeras sesiones y activa automáticamente un Random Forest personalizado por usuario cuando se acumulan suficientes datos.
+Motor de recomendación musical (music_engine.py) con selección por reglas de BPM y mood, epsilon-greedy para exploración, y aprendizaje por refuerzo que actualiza el reward de cada canción según si el estado cognitivo mejoró o empeoró durante su reproducción.
+Perfil personal de usuario que registra y actualiza los valores basales de GSR, RMSSD y frecuencia respiratoria con media exponencial sesión a sesión.
+Revisión de literatura científica
+Búsqueda y síntesis de más de 40 artículos científicos de alto impacto (Scopus, ScienceDirect, PMC) que sustentan los umbrales de clasificación y los parámetros del motor musical.
+Los umbrales del clasificador están calibrados con evidencia científica revisada: GSR 2–8 µS para concentración óptima (Nourbakhsh et al., 2012), RMSSD >30 ms para tono vagal saludable (Frontiers Neuroscience, 2019), respiración 10–16 rpm para zona de concentración (PMC Systematic Review, 2016).
+Los parámetros musicales del motor están fundamentados en: música 60–80 BPM para concentración (Gonzalez & Aiello, 2019), 45–70 BPM para reducción de estrés (Hasegawa et al., 2004), música instrumental sin letra como óptima para tareas cognitivas.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+3.3 Estado del aplicativo 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+4. Arquitectura del Sistema Implementado
+4.1 Diagrama de capas
+El sistema está organizado en cuatro capas funcionales que operan de forma secuencial y en tiempo real:
+
+
+4.2 Módulos de software desarrollados
+
+
+5. Fundamento Científico Aplicado al Sistema
+5.1 Umbrales de clasificación de estado cognitivo
+Los umbrales implementados en el clasificador heurístico están directamente fundamentados en la revisión de literatura científica realizada. La siguiente tabla resume los valores de referencia utilizados y sus fuentes:
+
+
+Hay que aclarar que las señales RMSSD y SDNN, las obtendremos parcialmente dada la resolución de muestreo del MySignals (50Hz = 20ms por muestra), y que el sistema los usa como indicadores relativos de tendencia más que como valores clínicos precisos.
+
+5.2 Parámetros musicales del motor de recomendación
+Los rangos de BPM y categorías de música implementados en el motor de recomendación se fundamentan en la literatura revisada:
+
+
+6. Plan de Trabajo — Próximas Etapas
+6.1 Fase 2 — Validación hardware y calibración personal (Inmediata)
+Esta fase se centra en completar la validación del hardware y comenzar la recolección de datos reales con usuarios.
+Conectar y validar el sensor ECG con electrodos Ag/AgCl sobre el cuerpo (negro en clavícula derecha, rojo en lado izquierdo del pecho) y confirmar que la señal produce picos R detectables para el cálculo de HRV.
+Conectar y validar el sensor GSR con los electrodos de dedo en índice y medio de la mano no dominante, confirmar valores en el rango 1–20 µS.
+Realizar una sesión de calibración basal para cada usuario (5 minutos en reposo) que establezca los valores personales de referencia en el perfil del clasificador.
+Organizar la carpeta de música en subcarpetas (focus/, calm/, energize/, stress_relief/) con canciones instrumentales clasificadas por BPM.
+Ejecutar una primera sesión completa del sistema integrado (main.py) con los tres sensores activos y música reproduciéndose, verificando el flujo completo desde captura hasta recomendación.
+6.2 Fase 3 — Protocolo experimental y recolección de datos (Corto plazo)
+Diseño e implementación del protocolo experimental para generar los datos de entrenamiento del modelo de ML.
+Diseñar el protocolo experimental: definir tareas cognitivas de dificultad conocida (aritmética mental, lectura comprensiva, tarea n-back) que induzcan distintos niveles de concentración y estrés.
+Definir condiciones de música (con música adaptativa, con música fija, sin música) para comparar el efecto del sistema.
+Incluir autorreporte subjetivo (escala NASA-TLX o similar) al final de cada sesión para validar las etiquetas de estado inferidas por el sistema.
+Conducir un mínimo de 10 sesiones por usuario para acumular suficientes datos y activar el clasificador de Random Forest personalizado.
+6.3 Fase 4 — Entrenamiento del modelo y evaluación (Mediano plazo)
+Verificar el reentrenamiento automático del Random Forest una vez acumuladas 50 muestras por usuario y comparar su precisión con la heurística base.
+Analizar los rewards acumulados por canción para identificar qué características musicales son más efectivas para cada usuario y estado.
+Evaluar la efectividad del sistema comparando el tiempo en estado de alta concentración entre condiciones: sistema activo vs. música fija vs. sin música.
+Realizar ajustes a los umbrales del clasificador y a los parámetros del motor musical según los resultados obtenidos.
+6.4 Fase 5 — Documentación y presentación final (Largo plazo)
+Documentar resultados con análisis estadístico de la evolución del estado de concentración por usuario.
+Redactar el informe final del proyecto con metodología, resultados, discusión y conclusiones.
+Preparar presentación para sustentación ante el docente y demás evaluadores.
+
+6.5 Cronograma de actividades
+
+
+7. Dificultades Encontradas y Soluciones Aplicadas
+Durante el desarrollo de la Fase 1 se presentaron varios obstáculos técnicos que fueron resueltos de manera sistemática. Se documentan aquí como referencia metodológica:
+
+
+8. Referencias Bibliográficas Consultadas
+Las siguientes referencias han sido consultadas directamente para fundamentar las decisiones de diseño del sistema:
+
+Nourbakhsh, N., Wang, Y., Chen, F., & Calvo, R. A. (2012). Using galvanic skin response for cognitive load measurement in arithmetic and reading tasks. OzCHI 2012. https://www.scopus.com/pages/publications/84872310067
+Alshanskaia, E. I., et al. (2024). Heart rate response to cognitive load as a marker of depression and increased anxiety. Frontiers in Psychiatry. https://www.scopus.com/pages/publications/85199371781
+Hasegawa, H., et al. (2004). Psychological and physiological evaluations of music listening for mental stress. Hokkaido Journal of Medical Science. https://www.scopus.com/pages/publications/4644280630
+Gonzalez, M. F., & Aiello, J. R. (2019). More than meets the ear: Investigating how music affects cognitive task performance. Journal of Experimental Psychology: Applied. https://www.scopus.com/pages/publications/85060942957
+De Francesco, L., et al. (2025). What you listen to makes a difference: The impact of music on attention and well-being. Annals of the New York Academy of Sciences. https://www.scopus.com/pages/publications/105015474832
+Bussolan, A., et al. (2025). MultiPhysio-HRC: A Multimodal Physiological Signals Dataset. Robotics. https://www.scopus.com/pages/publications/105026511760
+Aguilar, B. A. J., et al. (2025). Multimodal Data Fusion Architecture for Real-Time Physiological Signal Processing. LA-CCI 2025. https://www.scopus.com/pages/publications/105031425386
+Bota, P. J., et al. (2019). A Review, Current Challenges, and Future Possibilities on Emotion Recognition Using Machine Learning. IEEE Access. https://www.scopus.com/pages/publications/85077742997
+Zhang, J., et al. (2020). Emotion recognition using multi-modal data and machine learning techniques. Information Fusion. https://www.scopus.com/pages/publications/85079047781
+Monteith, K., et al. (2013). Automatic Generation of Music for Inducing Physiological Response. CogSci 2013. https://www.scopus.com/pages/publications/85009254380
+Prinsloo, G. E., et al. (2013). The effect of a single session of HRV biofeedback on EEG. Applied Psychophysiology Biofeedback. https://www.scopus.com/pages/publications/84874108770
+Markova, V., et al. (2019). CLAS: A Database for Cognitive Load, Affect and Stress Recognition. BIA 2019. https://www.scopus.com/pages/publications/85079281190
+Frontiers in Neuroscience (2019). Heart Rate Variability and Cognitive Function: A Systematic Review. https://www.frontiersin.org/journals/neuroscience/articles/10.3389/fnins.2019.00710
+PMC (2016). Respiratory Changes in Response to Cognitive Load: A Systematic Review. https://pmc.ncbi.nlm.nih.gov/articles/PMC4923594/
+ScienceDirect (2016). Reference ranges for short-term heart rate variability — MESA study. https://www.sciencedirect.com/science/article/abs/pii/S0022073616300735
+
+Informe de avances — Proyecto de Automatización  ·  Ingeniería de Sistemas  ·  Abril 2026
