@@ -71,3 +71,12 @@ yarn-error.log*
 .pnpm-debug.log*
 .sass-cache/
 .eslintcache
+
+#########33-------------------------------------------------------------------
+# CARPETAS ESPECÍFICAS DEL PROYECTO (Ajustar según sea necesario)
+
+musica/
+
+# Ignorar las carpetas de perfiles y sesiones
+perfiles/
+sesiones/
