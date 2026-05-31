@@ -539,8 +539,8 @@ def parse_args() -> argparse.Namespace:
         description="Sistema Adaptativo de Recomendación Musical")
     p.add_argument("--user",    default="estudiante", help="ID de usuario")
     p.add_argument("--port",    default=SERIAL_PORT,  help="Puerto serial")
-    p.add_argument("--api-key", default=os.getenv("ANTHROPIC_API_KEY", ""),
-                   help="Anthropic API key (o env ANTHROPIC_API_KEY)")
+    p.add_argument("--api-key", default=os.getenv("GROQ_API_KEY", ""),
+                   help="Groq API key (o env GROQ_API_KEY) — gratis en console.groq.com")
     p.add_argument("--demo",    action="store_true",
                    help="Modo simulación sin hardware")
     p.add_argument("--calibrate", type=int, default=0, metavar="SEG",

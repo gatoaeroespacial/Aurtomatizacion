@@ -86,8 +86,12 @@ class SessionContext:
 
 class LLMClient:
     """
-    Cliente HTTP para la API de Anthropic.
-    No usa el SDK para minimizar dependencias.
+    Cliente HTTP para Groq (OpenAI-compatible API).
+    API key gratuita en: https://console.groq.com/keys
+    Modelos recomendados:
+      llama-3.3-70b-versatile  — mejor calidad (default)
+      llama-3.1-8b-instant     — más rápido, menor latencia
+      mixtral-8x7b-32768       — contexto largo
     """
 
     def __init__(self):
@@ -100,7 +104,7 @@ class LLMClient:
             return
         self._api_key = api_key
         self._enabled = True
-        logger.info("LLM configurado con modelo %s", LLM_MODEL)
+        logger.info("Groq LLM configurado: %s", LLM_MODEL)
 
     @property
     def enabled(self) -> bool:
@@ -109,8 +113,8 @@ class LLMClient:
     def call(self, system: str, user: str,
              max_tokens: int = LLM_MAX_TOKENS) -> Optional[str]:
         """
-        Llamada directa a /v1/messages.
-        Retorna el texto de respuesta o None si falla.
+        Llamada a Groq /v1/chat/completions (formato OpenAI).
+        Retorna texto o None si falla.
         """
         if not self._enabled:
             return None
@@ -118,17 +122,19 @@ class LLMClient:
         payload = json.dumps({
             "model": LLM_MODEL,
             "max_tokens": max_tokens,
-            "system": system,
-            "messages": [{"role": "user", "content": user}],
+            "temperature": 0.4,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user},
+            ],
         }).encode("utf-8")
 
         req = urllib.request.Request(
             LLM_ENDPOINT,
             data=payload,
             headers={
-                "Content-Type":      "application/json",
-                "x-api-key":         self._api_key,
-                "anthropic-version": "2023-06-01",
+                "Content-Type":  "application/json",
+                "Authorization": f"Bearer {self._api_key}",
             },
             method="POST",
         )
@@ -139,17 +145,20 @@ class LLMClient:
                 raw = json.loads(resp.read().decode("utf-8"))
             latency = (time.time() - t0) * 1000
 
-            text = raw.get("content", [{}])[0].get("text", "")
-            logger.debug("LLM respondió en %.0f ms (%d chars)",
+            text = raw["choices"][0]["message"]["content"]
+            logger.debug("Groq respondió en %.0f ms (%d chars)",
                          latency, len(text))
             return text
 
         except urllib.error.HTTPError as e:
-            logger.error("LLM HTTP %d: %s", e.code, e.read().decode()[:200])
+            body = e.read().decode()[:300]
+            logger.error("Groq HTTP %d: %s", e.code, body)
         except urllib.error.URLError as e:
-            logger.error("LLM URL error: %s", e.reason)
+            logger.error("Groq URL error: %s", e.reason)
+        except (KeyError, IndexError) as e:
+            logger.error("Groq respuesta inesperada: %s", e)
         except Exception as e:
-            logger.error("LLM error inesperado: %s", e)
+            logger.error("Groq error inesperado: %s", e)
 
         return None
 
