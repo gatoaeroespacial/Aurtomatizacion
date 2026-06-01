@@ -703,6 +703,14 @@ class AdaptiveMusicSystem:
                 self._music.set_volume(vol)
                 logger.info("[WebCmd] Player: volume = %.2f", vol)
 
+            elif action == "experiment_condition":
+                cond = cmd.get("condition", "musica_adaptativa")
+                fixed = cmd.get("fixed_state", "media_conc")
+                self._music.set_experiment_mode(cond, fixed)
+                logger.info("[WebCmd] Experimento: %s (fijo=%s)", cond, fixed)
+                self._sys_state.add_music_event(
+                    f"[Web] Protocolo → {cond}")
+
         except Exception as e:
             logger.debug("Error procesando web cmd: %s", e)
             try: _CMD_PATH.unlink(missing_ok=True)

@@ -538,10 +538,30 @@ class MusicEngine:
 
         self._change_time: float = 0.0
         self._user_stopped: bool = False
+        self._experiment_mode: str = "musica_adaptativa"
+        self._experiment_fixed_state: str = "media_conc"
 
         n = self._library.index()
         logger.info("[Music] Engine listo: %d pistas, usuario='%s'",
                     n, user_id)
+
+    def set_experiment_mode(self, mode: str,
+                            fixed_state: str = "media_conc") -> None:
+        """Condiciones de protocolo: sin_musica | musica_fija | musica_adaptativa."""
+        self._experiment_mode = mode
+        self._experiment_fixed_state = fixed_state or "media_conc"
+        if mode == "sin_musica":
+            self.stop(user_initiated=True)
+            logger.info("[Music] Experimento: sin música")
+        elif mode == "musica_fija":
+            self.clear_user_stop()
+            self._do_change(
+                self._experiment_fixed_state, time.time(),
+                reason="Experimento: música fija")
+            logger.info("[Music] Experimento: música fija → %s", fixed_state)
+        else:
+            self.clear_user_stop()
+            logger.info("[Music] Experimento: música adaptativa")
 
     # ── API pública ───────────────────────────────────────────
 
@@ -551,6 +571,21 @@ class MusicEngine:
         Aplica hysteresis, evalúa si cambiar, actúa con fade.
         """
         now = time.time()
+
+        if self._experiment_mode == "sin_musica":
+            return self._current_tid
+
+        if self._experiment_mode == "musica_fija":
+            if self._current_tid is None:
+                self._do_change(
+                    self._experiment_fixed_state, now,
+                    reason="Música fija (experimento)")
+            elif (not self._player.is_paused()
+                  and not self._player.is_audible()):
+                self._do_change(
+                    self._experiment_fixed_state, now,
+                    reason="Reinicio música fija")
+            return self._current_tid
 
         if self._user_stopped:
             return self._current_tid

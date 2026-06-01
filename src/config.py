@@ -14,11 +14,12 @@ from pathlib import Path
 BASE_DIR      = Path(__file__).parent
 MUSIC_DIR     = BASE_DIR / "musica"
 SESSION_DIR   = BASE_DIR / "sesiones"
+EXPERIMENTS_DIR = BASE_DIR / "experimentos"
 MODEL_DIR     = BASE_DIR / "modelos"
 LOG_DIR       = BASE_DIR / "logs"
 PROFILE_DIR   = BASE_DIR / "perfiles"
 
-for d in [MUSIC_DIR, SESSION_DIR, MODEL_DIR, LOG_DIR, PROFILE_DIR]:
+for d in [MUSIC_DIR, SESSION_DIR, EXPERIMENTS_DIR, MODEL_DIR, LOG_DIR, PROFILE_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # ── Serial / Arduino ──────────────────────────────────────────
@@ -103,6 +104,32 @@ MUSIC_FEEDBACK_EVERY = 3      # aplicar cada N ventanas (no en todas)
 # Simulación — transiciones fisiológicas
 SIM_LERP_SEC         = 12.0   # constante de tiempo objetivo→señal (s)
 SIM_MANUAL_LOCK_SEC  = 90.0   # pausa feedback musical tras ajuste manual
+
+# ── Tareas cognitivas experimentales ─────────────────────────
+EXP_NBACK_TRIALS       = 40
+EXP_NBACK_STIM_SEC     = 3.2
+EXP_NBACK_ISI_SEC      = 0.3
+EXP_NBACK_TARGET_RATE  = 0.35
+
+EXP_STROOP_TRIALS      = 40
+EXP_STROOP_STIM_SEC    = 3.0
+EXP_STROOP_ISI_SEC     = 0.4
+
+EXP_MUSIC_CONDITIONS = (
+    "sin_musica",
+    "musica_fija",
+    "musica_adaptativa",
+)
+
+# Calificación compuesta (0–100)
+EXP_GRADE_EXCELLENT  = 90.0
+EXP_GRADE_GOOD       = 75.0
+EXP_GRADE_FAIR       = 60.0
+EXP_STROOP_ACC_WEIGHT  = 0.65   # precisión en Stroop
+EXP_STROOP_SPEED_WEIGHT = 0.35  # velocidad (RT)
+EXP_STROOP_RT_IDEAL_MS  = 900.0   # RT de referencia (rápido)
+EXP_STROOP_RT_SLOW_MS   = 2800.0  # RT muy lento → 0 en componente velocidad
+EXP_NBACK_OMISSION_PENALTY = 12.0  # puntos máx. restados por omisiones (proporcional)
 
 # ── LLM ───────────────────────────────────────────────────────
 # Groq — API gratuita: https://console.groq.com/keys

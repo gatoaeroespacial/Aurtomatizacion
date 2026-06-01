@@ -1,0 +1,3 @@
+run_id,task,music_condition,started_at,accuracy,mean_rt_ms,errors,n_correct,omissions,score,grade,bpm_mean,rmssd_mean,gsr_mean,resp_mean
+24892d7179f9,nback_2,sin_musica,1780300290.8288481,0.7368,1550.9,10,28,9,70.8,Regular,62.75,435.15,4.269,14.0
+bca9956c6a84,nback_2,sin_musica,1780300410.0382214,0.9474,1261.7,2,36,2,94.1,Excelente,63.02,385.42,3.728,14.0

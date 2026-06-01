@@ -108,6 +108,10 @@ footer {visibility: hidden;}
 
 @st.cache_data(ttl=0.4)
 def _load_state() -> dict:
+    return _load_state_live()
+
+
+def _load_state_live() -> dict:
     if not STATE_PATH.exists():
         return {}
     try:
@@ -348,9 +352,24 @@ def _render_player(s: dict) -> None:
 # ─────────────────────────────────────────────────────────────
 
 def render() -> None:
+    from experiment_ui import render_experiments
+
     s = _load_state()
-    demo = s.get("demo_mode", False)
     connected = bool(s)
+
+    page = st.radio(
+        "Vista",
+        ["Dashboard", "Experimentos"],
+        horizontal=True,
+        key="app_page",
+        label_visibility="collapsed",
+    )
+
+    if page == "Experimentos":
+        render_experiments(connected, _load_state_live, _send_cmd)
+        return
+
+    demo = s.get("demo_mode", False)
 
     # ── Cabecera ──────────────────────────────────────────────
     c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
