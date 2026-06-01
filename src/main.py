@@ -2,17 +2,19 @@
 ================================================================
 MAIN.PY — Orquestador del Sistema Adaptativo de Recomendación Musical
 ================================================================
-Pipeline completo:
-  Serial (Arduino) → SignalProcessor → Classifier → MusicEngine
-                   ↘ LLMEngine (análisis asíncrono)
-                   ↘ Dashboard (visualización)
-                   ↘ SessionLogger (persistencia)
+Integra:
+  SerialReader (hardware o simulación controlada)
+  SignalProcessor → Classifier → MusicEngine
+  LLMEngine (hilo asíncrono)
+  Dashboard (hilo de visualización)
+  SessionLogger (CSV persistente)
+  SimulationController (panel interactivo en modo demo)
 
 Uso:
-  python main.py [--user usuario] [--api-key sk-ant-xxx] [--port COM4]
-  python main.py --demo                (modo simulación sin hardware)
-
-El sistema arranca en modo simulación si el serial falla.
+  python main.py --demo                         # simulación
+  python main.py --port COM4 --user yo          # hardware
+  python main.py --demo --api-key gsk_xxx       # con LLM Groq
+  python main.py --demo --calibrate 60          # calibración previa
 ================================================================
 """
 
@@ -29,35 +31,42 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
 
 import numpy as np
 
-# ── Configurar logging antes de importar módulos propios ─────
 from config import (
     SERIAL_PORT, SERIAL_BAUD, SERIAL_TIMEOUT, SAMPLE_HZ,
     SESSION_DIR, LOG_DIR, LOG_LEVEL, LOG_FORMAT,
-    LLM_INSIGHT_EVERY, RL_EVAL_DELAY_SEC, WINDOW_SECONDS,
-    CLASSIFIER_HEURISTIC_UNTIL,
+    LLM_INSIGHT_EVERY, WINDOW_SECONDS, CLASSIFIER_HEURISTIC_UNTIL,
+    DASH_UPDATE_MS, BASE_DIR,
+    MUSIC_FEEDBACK_RATE, MUSIC_FEEDBACK_EVERY,
 )
 
+# Rutas de archivos de estado compartido con dashboard_web.py
+_STATE_PATH = BASE_DIR / "state.json"
+_SIM_PATH   = BASE_DIR / "sim_ctrl.json"
+_CMD_PATH   = BASE_DIR / "sim_cmd.json"   # comandos web → main
+
+# ── Logging ───────────────────────────────────────────────────
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
     format=LOG_FORMAT,
     handlers=[
-        logging.StreamHandler(sys.stdout),
         logging.FileHandler(
             LOG_DIR / f"sesion_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
-            encoding="utf-8"
-        ),
+            encoding="utf-8"),
     ]
 )
 logger = logging.getLogger("main")
+# En modo interactivo el dashboard ocupa la terminal — log va solo a archivo
+# Para depuración agrega StreamHandler aquí si necesitas.
 
-from signal_processor import SignalProcessor, RawSample, SignalFeatures
+from signal_processor import SignalProcessor, RawSample
 from classifier import CognitiveClassifier, ClassificationResult
 from music_engine import MusicEngine
 from llm_integration import LLMEngine
+from dashboard import Dashboard, SystemState, SimulationController
 
 
 # ─────────────────────────────────────────────────────────────
@@ -66,50 +75,50 @@ from llm_integration import LLMEngine
 
 class SerialReader:
     """
-    Lee líneas CSV del Arduino en un hilo separado.
-    Formato: ts_ms,gsr_cond,gsr_res,gsr_volt,air_volt,ecg_volt
+    Lee muestras del Arduino o las genera sintéticamente.
+    En modo simulación, el SimulationController dicta los parámetros
+    en tiempo real — sin editar código.
     """
 
-    def __init__(self, port: str, baud: int):
-        self._port   = port
-        self._baud   = baud
-        self._ser    = None
-        self._ok     = False
+    def __init__(self, port: str, baud: int,
+                 sim_ctrl: Optional[SimulationController] = None):
+        self._port    = port
+        self._baud    = baud
+        self._sim     = sim_ctrl
+        self._ser     = None
+        self._ok      = False
         self._running = False
-        self._lock   = threading.Lock()
-        self._queue: list = []   # cola de muestras sin procesar
-        self._thread: Optional[threading.Thread] = None
+        self._lock    = threading.Lock()
+        self._queue:  list = []
 
     def start(self) -> bool:
-        try:
-            import serial
-            self._ser = serial.Serial(
-                self._port, self._baud,
-                timeout=SERIAL_TIMEOUT
-            )
-            time.sleep(2.0)   # Espera reset del Arduino
-            self._ok = True
-            logger.info("Serial OK: %s @ %d baud", self._port, self._baud)
-        except Exception as e:
-            logger.warning("Serial no disponible (%s) — modo SIMULACIÓN", e)
-            self._ok = False
+        if self._sim is None:
+            # Intentar conexión real
+            try:
+                import serial
+                self._ser = serial.Serial(
+                    self._port, self._baud, timeout=SERIAL_TIMEOUT)
+                time.sleep(2.0)
+                self._ok = True
+                logger.info("Serial OK: %s @ %d baud", self._port, self._baud)
+            except Exception as e:
+                logger.warning("Serial no disponible (%s) — SIMULACIÓN", e)
+                self._ok  = False
+                self._sim = SimulationController()  # fallback
 
         self._running = True
         target = self._read_loop if self._ok else self._simulate_loop
-        self._thread = threading.Thread(target=target, daemon=True)
-        self._thread.start()
+        threading.Thread(target=target, daemon=True,
+                         name="serial-reader").start()
         return self._ok
 
     def stop(self) -> None:
         self._running = False
         if self._ser:
-            try:
-                self._ser.close()
-            except Exception:
-                pass
+            try: self._ser.close()
+            except Exception: pass
 
     def drain(self) -> list:
-        """Vacía y retorna la cola de muestras pendientes."""
         with self._lock:
             items = list(self._queue)
             self._queue.clear()
@@ -126,15 +135,15 @@ class SerialReader:
                 raw = self._ser.readline().decode("utf-8", errors="ignore").strip()
                 if not raw or raw.startswith("#"):
                     continue
-                sample = self._parse_line(raw)
-                if sample:
+                s = self._parse(raw)
+                if s:
                     with self._lock:
-                        self._queue.append(sample)
+                        self._queue.append(s)
             except Exception as e:
                 logger.debug("Serial read error: %s", e)
                 time.sleep(0.1)
 
-    def _parse_line(self, line: str) -> Optional[RawSample]:
+    def _parse(self, line: str) -> Optional[RawSample]:
         parts = line.split(",")
         if len(parts) != 6:
             return None
@@ -150,79 +159,79 @@ class SerialReader:
         except ValueError:
             return None
 
-    # ── Simulación ────────────────────────────────────────────
+    # ── Simulación controlada ─────────────────────────────────
     def _simulate_loop(self) -> None:
         """
-        Genera señales sintéticas realistas para pruebas sin hardware.
-        Ciclo de trabajo: 90s concentración alta, 30s estrés, 60s media.
+        Genera señales fisiológicas sintéticas a 50 Hz.
+        Todos los parámetros vienen del SimulationController —
+        el usuario los modifica desde el panel del dashboard.
         """
-        t = 0.0
-        interval = 1.0 / SAMPLE_HZ
-        ts_ms = 0
+        t      = 0.0
+        ts_ms  = 0
+        ivl    = 1.0 / SAMPLE_HZ
 
         while self._running:
-            t    += interval
-            ts_ms = int(t * 1000)
+            t     += ivl
+            ts_ms  = int(t * 1000)
+            p      = self._sim.get()   # parámetros actuales
 
-            # Ciclo de estado simulado (~3 min por ciclo)
-            cycle = t % 180
-            if cycle < 90:
-                # Alta concentración
-                gsr_cond = 3.5 + 0.5 * np.sin(t * 0.02) + np.random.normal(0, 0.05)
-                bpm_base = 68
-                resp_amp = 0.3
-                resp_freq = 13 / 60  # 13 rpm
-            elif cycle < 120:
-                # Estrés
-                gsr_cond = 10.0 + 1.5 * np.sin(t * 0.05) + np.random.normal(0, 0.2)
-                bpm_base = 95
-                resp_amp = 0.2
-                resp_freq = 20 / 60  # 20 rpm
-            else:
-                # Concentración media
-                gsr_cond = 5.0 + 0.8 * np.sin(t * 0.03) + np.random.normal(0, 0.08)
-                bpm_base = 75
-                resp_amp = 0.35
-                resp_freq = 15 / 60
+            bpm_t      = p["bpm_target"]
+            resp_t     = p["resp_rate"]
+            resp_reg   = p["resp_reg"]
+            gsr_base   = p["gsr_scl"]
+            stress     = p["stress_level"]   # 0–1
+            noise      = p["noise_level"]    # 0–1
 
-            gsr_cond = max(0.1, gsr_cond)
-            gsr_res  = 1.0 / (gsr_cond * 1e-6) if gsr_cond > 0 else 1e6
-            gsr_volt = gsr_cond * 0.05  # aproximación lineal
+            # ── GSR: stress eleva SCL y añade SCR ────────────
+            gsr_cond = (gsr_base
+                        + stress * 6.0
+                        + 0.5 * np.sin(t * 0.03)
+                        + np.random.normal(0, noise * 0.5))
+            gsr_cond  = max(0.05, gsr_cond)
+            gsr_res   = 1.0 / (gsr_cond * 1e-6)
+            gsr_volt  = min(5.0, gsr_cond * 0.05)
 
-            # Airflow: onda sinusoidal respiratoria
-            air_volt = 2.5 + resp_amp * np.sin(2 * np.pi * resp_freq * t)
+            # ── Airflow: freq = resp_rate, amp = regularidad ──
+            irreg  = (1 - resp_reg) * 0.15 * np.random.normal(0, 1)
+            air_volt = (2.5
+                        + 0.35 * np.sin(2 * np.pi * (resp_t / 60) * t + irreg)
+                        + np.random.normal(0, noise * 0.05))
+            air_volt = float(np.clip(air_volt, 0.0, 5.0))
 
-            # ECG sintético con latidos a ~bpm_base
-            bpm_var = bpm_base + 3 * np.sin(t * 0.1)
-            phase   = (t * bpm_var / 60) % 1.0
+            # ── ECG: BPM con variabilidad modulada por estrés ─
+            # Estrés alto → BPM sube, HRV baja (menos variabilidad)
+            bpm_now = bpm_t + stress * 20 + 3 * np.sin(t * 0.08)
+            hrv_amp  = max(0.01, 0.05 * (1 - stress * 0.7))
+            phase    = (t * bpm_now / 60) % 1.0
             if phase < 0.03:
-                ecg_volt = 2.5 + 1.2 * np.exp(-((phase - 0.015) ** 2) / 0.0001)
-            elif phase < 0.12:
-                ecg_volt = 2.5 - 0.1 * np.sin((phase - 0.03) * np.pi / 0.09)
+                ecg_volt = 2.5 + 1.1 * np.exp(
+                    -((phase - 0.015) ** 2) / 0.0001)
+            elif phase < 0.10:
+                ecg_volt = 2.5 - 0.08 * np.sin(
+                    (phase - 0.03) * np.pi / 0.07)
             else:
-                ecg_volt = 2.5 + np.random.normal(0, 0.005)
+                ecg_volt = 2.5 + np.random.normal(0, hrv_amp)
+            ecg_volt = float(np.clip(ecg_volt, 0.0, 5.0))
 
             sample = RawSample(
                 ts_ms    = ts_ms,
-                gsr_cond = gsr_cond,
-                gsr_res  = gsr_res,
-                gsr_volt = gsr_volt,
-                air_volt = float(air_volt),
-                ecg_volt = float(ecg_volt),
+                gsr_cond = float(gsr_cond),
+                gsr_res  = float(gsr_res),
+                gsr_volt = float(gsr_volt),
+                air_volt = air_volt,
+                ecg_volt = ecg_volt,
             )
             with self._lock:
                 self._queue.append(sample)
 
-            time.sleep(interval)
+            time.sleep(ivl)
 
 
 # ─────────────────────────────────────────────────────────────
-# LOGGER DE SESIÓN
+# SESSION LOGGER
 # ─────────────────────────────────────────────────────────────
 
 class SessionLogger:
-    """Persiste todas las clasificaciones y features en CSV."""
-
     def __init__(self, user_id: str):
         ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = SESSION_DIR / f"sesion_{user_id}_{ts}.csv"
@@ -234,7 +243,7 @@ class SessionLogger:
             "resp_rate", "resp_reg", "scl", "scr_count", "gsr_std",
             "signal_quality", "track_name", "track_score",
         ])
-        logger.info("Sesión guardada en: %s", path)
+        logger.info("CSV sesión: %s", path)
 
     def log(self, result: ClassificationResult,
             track_name: Optional[str] = None,
@@ -243,19 +252,19 @@ class SessionLogger:
         self._csv.writerow([
             datetime.now().isoformat(),
             result.state, round(result.confidence, 4), result.method,
-            round(f.bpm, 2)       if f else "",
-            round(f.rmssd, 2)     if f else "",
-            round(f.sdnn, 2)      if f else "",
-            f.nn50                if f else "",
-            round(f.pnn50, 2)     if f else "",
-            round(f.resp_rate, 2) if f else "",
-            round(f.resp_reg, 3)  if f else "",
-            round(f.scl, 4)       if f else "",
-            f.scr_count           if f else "",
-            round(f.gsr_std, 4)   if f else "",
+            round(f.bpm, 2)        if f else "",
+            round(f.rmssd, 2)      if f else "",
+            round(f.sdnn, 2)       if f else "",
+            f.nn50                 if f else "",
+            round(f.pnn50, 2)      if f else "",
+            round(f.resp_rate, 2)  if f else "",
+            round(f.resp_reg, 3)   if f else "",
+            round(f.scl, 4)        if f else "",
+            f.scr_count            if f else "",
+            round(f.gsr_std, 4)    if f else "",
             round(f.signal_quality, 3) if f else "",
             track_name or "",
-            round(track_score, 4) if track_score is not None else "",
+            round(track_score, 4)  if track_score is not None else "",
         ])
         self._f.flush()
 
@@ -268,294 +277,434 @@ class SessionLogger:
 # ─────────────────────────────────────────────────────────────
 
 class AdaptiveMusicSystem:
-    """
-    Orquestador de todo el pipeline.
-    """
 
     def __init__(self, user_id: str, serial_port: str,
                  api_key: Optional[str] = None, demo: bool = False):
-        self.user_id = user_id
-        self._demo   = demo
+        self.user_id  = user_id
+        self._demo    = demo
         self._running = False
 
-        # Módulos
-        self._serial      = SerialReader(
-            "DEMO" if demo else serial_port, SERIAL_BAUD)
-        self._processor   = SignalProcessor()
-        self._classifier  = CognitiveClassifier(user_id)
-        self._music       = MusicEngine(user_id)
-        self._llm         = LLMEngine(user_id)
+        # SimulationController: solo en modo demo
+        self._sim_ctrl = SimulationController() if demo else None
+
+        # SerialReader — recibe sim_ctrl para controlar la simulación
+        self._serial = SerialReader(
+            serial_port if not demo else "DEMO",
+            SERIAL_BAUD,
+            sim_ctrl=self._sim_ctrl)
+
+        # Pipeline de procesamiento
+        self._processor  = SignalProcessor()
+        self._classifier = CognitiveClassifier(user_id)
+        self._music      = MusicEngine(user_id)
+        self._llm        = LLMEngine(user_id)
         self._session_log = SessionLogger(user_id)
 
         if api_key:
             self._llm.configure(api_key)
 
-        # Estado del sistema
+        # Estado compartido con el dashboard
+        self._sys_state = SystemState(
+            demo_mode=demo,
+            llm_enabled=self._llm.enabled,
+        )
+
+        # Dashboard
+        self._dashboard = Dashboard(
+            state=self._sys_state,
+            sim_ctrl=self._sim_ctrl,
+            refresh_ms=DASH_UPDATE_MS,
+        )
+
+        # Variables de control
         self._current_state:  Optional[str] = None
         self._prev_state:     Optional[str] = None
         self._last_result:    Optional[ClassificationResult] = None
         self._windows_processed = 0
-        self._state_changed_at  = 0.0
-
-        # Calibración
-        self._calibrated = False
-        self._baseline:  Optional[Dict] = None
+        self._session_history: list = []   # para comparativa histórica
 
         self._load_baseline()
 
-        # Shutdown handler
-        signal.signal(signal.SIGINT,  self._shutdown_handler)
-        signal.signal(signal.SIGTERM, self._shutdown_handler)
+        signal.signal(signal.SIGINT,  self._on_shutdown)
+        signal.signal(signal.SIGTERM, self._on_shutdown)
 
     # ── Lifecycle ─────────────────────────────────────────────
 
     def start(self) -> None:
         self._running = True
-        logger.info("=" * 60)
-        logger.info("Sistema Adaptativo de Recomendación Musical")
-        logger.info("Usuario: %s | Demo: %s | LLM: %s",
-                    self.user_id, self._demo, self._llm.enabled)
-        logger.info("Biblioteca musical: %s", self._music.get_library_summary())
-        logger.info("=" * 60)
 
-        if self._demo:
-            logger.info("Modo DEMO activo — señales simuladas")
+        # Limpiar pantalla y arrancar dashboard
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+        self._dashboard.start()
+
+        logger.info("Sistema iniciado | user=%s demo=%s llm=%s",
+                    self.user_id, self._demo, self._llm.enabled)
 
         self._serial.start()
+        self._sys_state.update(serial_ok=self._serial.connected)
         self._run_loop()
 
     def stop(self) -> None:
         self._running = False
+        self._dashboard.stop()
         self._serial.stop()
         self._music.stop()
         self._save_baseline()
         self._classifier.save_model()
 
-        # Reporte final de sesión
-        logger.info("Generando reporte de sesión...")
         report = self._llm.generate_session_report()
         if report:
-            logger.info("\n%s\n", report.content[:500])
+            logger.info("Reporte sesión:\n%s", report.content[:600])
 
         self._session_log.close()
-        logger.info("Sistema detenido.")
+        logger.info("Sistema detenido correctamente.")
 
     # ── Loop principal ────────────────────────────────────────
 
     def _run_loop(self) -> None:
-        """
-        Loop principal a ~50 Hz.
-        1. Drain de la cola serial
-        2. Agregar muestras al procesador
-        3. Extraer features si la ventana está lista
-        4. Clasificar estado cognitivo
-        5. Actualizar motor musical
-        6. LLM (asíncrono, cada N ventanas)
-        7. Logging
-        """
-        loop_interval = 1.0 / SAMPLE_HZ
+        ivl = 1.0 / SAMPLE_HZ
 
         while self._running:
             t0 = time.time()
 
-            # 1. Procesar todas las muestras en cola
+            # 1. Muestras del serial
             samples = self._serial.drain()
-            for sample in samples:
-                self._processor.add_sample(sample)
+            for s in samples:
+                self._processor.add_sample(s)
 
-            # 2. Extraer features (solo si ventana completa)
+            # 2. Progreso del buffer
+            buf_n = len(self._processor._ecg_buf)
+            self._sys_state.update(
+                buffer_pct=min(100.0, buf_n / 1500 * 100))
+
+            # 3. Features
             features = self._processor.get_features()
             if features is None:
-                elapsed = time.time() - t0
-                time.sleep(max(0, loop_interval - elapsed))
-                self._print_progress()
+                time.sleep(max(0, ivl - (time.time() - t0)))
                 continue
 
-            # 3. Clasificar
+            # 4. Clasificar
             result = self._classifier.classify(features)
             self._windows_processed += 1
             self._last_result = result
 
-            # 4. Detectar cambio de estado
+            # 5. Detectar cambio de estado
             state_changed = (self._current_state is not None
                              and result.state != self._current_state)
             self._prev_state    = self._current_state
             self._current_state = result.state
 
-            # 5. Motor musical
-            track_tid = self._music.update(result.state, result.confidence)
-            track     = self._music.get_current_track()
-            track_name  = track.name  if track else None
-            track_score = self._music.get_current_score()
+            # 6. Motor musical
+            self._music.update(result.state, result.confidence)
+            track      = self._music.get_current_track()
+            track_ts   = self._music.get_current_ts()
+            track_name = track.name if track else "—"
+            track_score = self._music.get_current_score() or 0.0
 
-            # 5b. Calcular reward si cambió de estado (evaluación RL)
+            # 7. Reward al cambiar estado
             if state_changed and self._prev_state:
                 reward = self._music.compute_and_apply_reward(
                     self._prev_state, result.state)
-                logger.info("RL Reward: %.3f (%s → %s)",
-                            reward, self._prev_state, result.state)
-
-            # 6. LLM — asíncrono para no bloquear el loop
-            if state_changed and self._prev_state:
+                msg = (f"Cambio '{self._prev_state}' → '{result.state}' "
+                       f"| reward {reward:+.3f}")
+                self._sys_state.add_music_event(msg)
+                logger.info("[RL] %s", msg)
                 self._async_llm(
-                    lambda: self._llm.on_state_change(
-                        self._prev_state, result.state))
+                    lambda ps=self._prev_state, ns=result.state:
+                        self._llm.on_state_change(ps, ns))
 
+            # Detectar cambio de canción
+            if (self._music.last_event and
+                    self._music.last_event.started_at !=
+                    getattr(self, "_last_event_ts", 0)):
+                ev = self._music.last_event
+                self._last_event_ts = ev.started_at
+                self._sys_state.add_music_event(
+                    f"🎵 {ev.track_name} → {ev.state_at_end or '?'} "
+                    f"| {ev.change_reason[:50]}")
+
+            # 8. LLM asíncrono
             self._llm.update_context(result, track_name)
             if self._windows_processed % LLM_INSIGHT_EVERY == 0:
                 self._async_llm(self._llm.maybe_generate_insight)
-
-            # Validación de baja confianza
             if result.confidence < 0.35:
                 self._async_llm(
-                    lambda: self._llm.request_label_validation(result))
+                    lambda r=result:
+                        self._llm.request_label_validation(r))
 
-            # 7. Logging
+            # 9. Actualizar SystemState para el dashboard
+            f = features
+            self._sys_state.update(
+                bpm=f.bpm, rmssd=f.rmssd, sdnn=f.sdnn,
+                nn50=f.nn50, pnn50=f.pnn50,
+                resp_rate=f.resp_rate, resp_reg=f.resp_reg,
+                scl=f.scl, scr_count=f.scr_count, gsr_std=f.gsr_std,
+                signal_quality=f.signal_quality,
+                cog_state=result.state,
+                confidence=result.confidence,
+                method=result.method,
+                class_scores=result.scores,
+                track_name=track_name,
+                track_state=self._music._current_state or "—",
+                track_score=track_score,
+                track_reward_sum=track_ts.reward_sum if track_ts else 0.0,
+                track_plays=track_ts.play_count if track_ts else 0,
+                seconds_played=self._music.seconds_played(),
+                change_reason=self._music.last_change_reason,
+                last_reward=track_ts.last_reward if track_ts else None,
+                windows_processed=self._windows_processed,
+                rf_samples=self._classifier.get_training_size(),
+                epsilon=self._music._rl.epsilon,
+                llm_enabled=self._llm.enabled,
+            )
+
+            # 10. Session log + historial
             self._session_log.log(result, track_name, track_score)
-            self._log_state(result, track_name)
+            f = features
+            self._session_history.append({
+                "ts": time.time(), "state": result.state,
+                "bpm": round(f.bpm, 1), "rmssd": round(f.rmssd, 1),
+                "scl": round(f.scl, 2), "resp": round(f.resp_rate, 1),
+                "conf": round(result.confidence, 2),
+            })
+            if len(self._session_history) > 200:
+                self._session_history = self._session_history[-200:]
 
-            elapsed = time.time() - t0
-            time.sleep(max(0, loop_interval - elapsed))
+            logger.info(
+                "W%d | %s (%.2f) | BPM:%.0f RMSSD:%.0f SCL:%.2f "
+                "resp:%.1f | 🎵 %s",
+                self._windows_processed, result.state, result.confidence,
+                f.bpm, f.rmssd, f.scl, f.resp_rate, track_name)
 
-    def _print_progress(self) -> None:
-        """Muestra progreso de llenado del buffer (primeros 30 s)."""
-        n = len(self._processor._ecg_buf)
-        total = 1500  # WINDOW_SAMPLES
-        if n < total and n % 50 == 0:
-            pct = int(n / total * 100)
-            bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
-            print(f"\r  Buffer: [{bar}] {pct}% ({n}/{total} muestras)  ",
-                  end="", flush=True)
-        elif n >= total:
-            print("\r" + " " * 60 + "\r", end="", flush=True)
+            # 11. Exportar JSON para dashboard web (cada 2 ventanas)
+            if self._windows_processed % 2 == 0:
+                self._export_state_json()
 
-    def _log_state(self, result: ClassificationResult,
-                   track_name: Optional[str]) -> None:
-        sensor = self._processor.get_sensor_status()
-        rf_n   = self._classifier.get_training_size()
-        method = result.method
-        if rf_n < CLASSIFIER_HEURISTIC_UNTIL:
-            method += f" (RF en {CLASSIFIER_HEURISTIC_UNTIL - rf_n} muestras)"
+            # 12. Feedback musical → simulador (solo demo, cada N ventanas)
+            if (self._sim_ctrl is not None
+                    and self._windows_processed % MUSIC_FEEDBACK_EVERY == 0):
+                self._apply_music_feedback()
 
-        logger.info(
-            "Estado: %-12s | Conf: %.2f | %s | "
-            "BPM: %4.0f | RMSSD: %4.0f | SCL: %.2f µS | "
-            "Resp: %.1f rpm | 🎵 %s",
-            result.state, result.confidence, method,
-            result.features.bpm    if result.features else 0,
-            result.features.rmssd  if result.features else 0,
-            result.features.scl    if result.features else 0,
-            result.features.resp_rate if result.features else 0,
-            track_name or "—",
-        )
+            # 13. Leer comandos del dashboard web (sim_cmd.json)
+            self._process_web_commands()
 
-        # Warnings de sensores
-        s = sensor
-        if not s.ecg_ok:     logger.warning("⚠ ECG sin señal — verifica electrodos")
-        if not s.gsr_ok:     logger.warning("⚠ GSR sin contacto dérmico")
-        if not s.airflow_ok: logger.warning("⚠ Airflow sin variación — verifica sensor")
+            time.sleep(max(0, ivl - (time.time() - t0)))
+
+    # ── LLM async ─────────────────────────────────────────────
+
+    def _async_llm(self, fn) -> None:
+        def _run():
+            try:
+                r = fn()
+                if r:
+                    logger.info("[LLM] %s: %s", r.type, r.content[:100])
+                    self._sys_state.update(last_insight=r.content[:300])
+            except Exception as e:
+                logger.debug("[LLM] Error async: %s", e)
+        threading.Thread(target=_run, daemon=True).start()
 
     # ── Calibración ───────────────────────────────────────────
 
     def run_calibration(self, duration_sec: int = 120) -> None:
-        """
-        Sesión de calibración: usuario en reposo durante `duration_sec`.
-        Llama a este método antes del loop principal para mejores resultados.
-        """
-        logger.info("Iniciando calibración — reposo %d s", duration_sec)
+        logger.info("Calibración: %d s de reposo", duration_sec)
         t0 = time.time()
         self._serial.start()
-
-        while time.time() - t0 < duration_sec and self._running:
-            samples = self._serial.drain()
-            for s in samples:
+        while time.time() - t0 < duration_sec:
+            for s in self._serial.drain():
                 self._processor.add_sample(s)
             elapsed = int(time.time() - t0)
-            print(f"\r  Calibrando: {elapsed}/{duration_sec} s", end="")
+            print(f"\r  Calibrando [{elapsed}/{duration_sec} s]", end="")
             time.sleep(0.1)
-
         print()
-        baseline = self._processor.compute_baseline(duration_sec)
-        if baseline:
-            self._baseline = baseline
-            self._processor.set_baseline(baseline)
-            self._classifier._heuristic.baseline = baseline
+        bl = self._processor.compute_baseline(duration_sec)
+        if bl:
+            self._baseline = bl
+            self._processor.set_baseline(bl)
+            self._classifier._heuristic.baseline = bl
             self._save_baseline()
-            logger.info("Calibración completada: %s", baseline)
-        else:
-            logger.warning("Calibración insuficiente — se usarán umbrales estándar")
+            logger.info("Baseline: %s", bl)
 
     def _save_baseline(self) -> None:
-        if not self._baseline:
+        bl = getattr(self, "_baseline", None)
+        if not bl:
             return
-        path = Path("perfiles") / f"baseline_{self.user_id}.json"
+        p = Path("perfiles") / f"baseline_{self.user_id}.json"
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self._baseline, f, indent=2)
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(bl, f, indent=2)
         except Exception as e:
             logger.error("Error guardando baseline: %s", e)
 
     def _load_baseline(self) -> None:
-        path = Path("perfiles") / f"baseline_{self.user_id}.json"
-        if path.exists():
-            try:
-                with open(path, encoding="utf-8") as f:
-                    self._baseline = json.load(f)
-                self._processor.set_baseline(self._baseline)
-                logger.info("Baseline cargado: %s", self._baseline)
-            except Exception as e:
-                logger.warning("No se pudo cargar baseline: %s", e)
-
-    # ── Async LLM ─────────────────────────────────────────────
-
-    def _async_llm(self, fn) -> None:
-        """Ejecuta una función LLM en un hilo separado."""
-        t = threading.Thread(target=self._safe_call, args=(fn,), daemon=True)
-        t.start()
-
-    @staticmethod
-    def _safe_call(fn) -> None:
+        p = Path("perfiles") / f"baseline_{self.user_id}.json"
+        if not p.exists():
+            return
         try:
-            result = fn()
-            if result:
-                logger.info("[LLM] %s: %s",
-                            result.type, result.content[:120])
+            with open(p, encoding="utf-8") as f:
+                self._baseline = json.load(f)
+            self._processor.set_baseline(self._baseline)
+            logger.info("Baseline cargado: %s", self._baseline)
         except Exception as e:
-            logger.debug("LLM async error: %s", e)
+            logger.warning("No se pudo cargar baseline: %s", e)
 
-    # ── Shutdown ──────────────────────────────────────────────
-
-    def _shutdown_handler(self, sig, frame) -> None:
-        logger.info("Señal de cierre recibida (%s)", sig)
+    def _on_shutdown(self, sig, frame) -> None:
+        logger.info("Shutdown (%s)", sig)
         self._running = False
+
+    # ── Exportación JSON para dashboard web ───────────────────
+
+    def _export_state_json(self) -> None:
+        """
+        Escribe state.json (leído por dashboard_web.py).
+        Escritura atómica: escribe en .tmp y luego renombra.
+        Incluye sim_params para que los sliders del dashboard
+        muestren siempre los valores actuales del SimulationController.
+        """
+        try:
+            snap = self._sys_state.snapshot()
+            snap["music_events"] = list(snap.get("music_events", []))
+            snap["ts"] = time.time()
+            snap["session_history"] = self._session_history[-50:]
+            # Parámetros actuales del simulador → sliders del dashboard
+            if self._sim_ctrl:
+                snap["sim_params"] = self._sim_ctrl.get()
+            tmp = _STATE_PATH.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(snap, f, default=str)
+            tmp.replace(_STATE_PATH)
+        except Exception as e:
+            logger.debug("Error exportando state.json: %s", e)
+
+    def _apply_music_feedback(self) -> None:
+        """
+        Feedback loop demo: la música activa arrastra gradualmente los
+        parámetros del SimulationController hacia el estado fisiológico
+        que en teoría produciría esa música en una persona real.
+
+        Categorías y sus objetivos (literatura científica):
+          focus        → BPM 68, resp 13, GSR 4 µS, estrés mínimo
+          calm         → BPM 72, resp 14, GSR 5 µS
+          energize     → BPM 82, resp 16, más activación
+          stress_relief→ BPM 63, resp 9, GSR 2.5 µS (desacelera todo)
+
+        En hardware real NO se llama — el cuerpo real reacciona solo.
+        """
+        if not self._sim_ctrl:
+            return
+        track = self._music.get_current_track()
+        if not track:
+            return
+
+        targets = {
+            "focus": {
+                "bpm_target": 68.0, "resp_rate": 13.0, "resp_reg": 0.88,
+                "gsr_scl": 4.0, "stress_level": 0.05,
+                "conc_level": 0.88, "noise_level": 0.05,
+            },
+            "calm": {
+                "bpm_target": 72.0, "resp_rate": 14.0, "resp_reg": 0.80,
+                "gsr_scl": 5.0, "stress_level": 0.10,
+                "conc_level": 0.60, "noise_level": 0.08,
+            },
+            "energize": {
+                "bpm_target": 82.0, "resp_rate": 16.0, "resp_reg": 0.70,
+                "gsr_scl": 6.5, "stress_level": 0.15,
+                "conc_level": 0.55, "noise_level": 0.10,
+            },
+            "stress_relief": {
+                "bpm_target": 63.0, "resp_rate": 9.0, "resp_reg": 0.92,
+                "gsr_scl": 2.5, "stress_level": 0.05,
+                "conc_level": 0.35, "noise_level": 0.04,
+            },
+        }
+
+        folder = track.folder
+        target = targets.get(folder)
+        if not target:
+            return
+
+        rate    = MUSIC_FEEDBACK_RATE
+        current = self._sim_ctrl.get()
+        moved   = []
+        for param, tgt_val in target.items():
+            cur_val = current.get(param, tgt_val)
+            if abs(cur_val - tgt_val) < 0.001:
+                continue
+            new_val = cur_val + rate * (tgt_val - cur_val)
+            if self._sim_ctrl.set_param(param, new_val):
+                moved.append(param)
+        if moved:
+            logger.debug("[Feedback] %s ajusta %s", folder, moved[:3])
+
+    def _export_sim_json(self) -> None:
+        """Escribe sim_ctrl.json con los parámetros actuales de simulación."""
+        if not self._sim_ctrl:
+            return
+        try:
+            tmp = _SIM_PATH.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._sim_ctrl.get(), f)
+            tmp.replace(_SIM_PATH)
+        except Exception as e:
+            logger.debug("Error exportando sim_ctrl.json: %s", e)
+
+    def _process_web_commands(self) -> None:
+        """
+        Lee sim_cmd.json escrito por dashboard_web.py.
+        Formato: {"action": "preset"|"set_param",
+                   "preset": "estres",          ← si action=preset
+                   "param": "bpm_target",        ← si action=set_param
+                   "value": 95.0,
+                   "ts": 1234567890.0}
+        Borra el archivo tras procesar para evitar re-ejecución.
+        """
+        if not self._sim_ctrl or not _CMD_PATH.exists():
+            return
+        try:
+            with open(_CMD_PATH, encoding="utf-8") as f:
+                cmd = json.load(f)
+            _CMD_PATH.unlink(missing_ok=True)
+
+            action = cmd.get("action")
+            if action == "preset":
+                name = cmd.get("preset", "")
+                if self._sim_ctrl.apply_preset(name):
+                    logger.info("[WebCmd] Preset aplicado: %s", name)
+                    self._sys_state.add_music_event(
+                        f"[Web] Preset → {name}")
+            elif action == "set_param":
+                param = cmd.get("param", "")
+                value = float(cmd.get("value", 0))
+                if self._sim_ctrl.set_param(param, value):
+                    logger.info("[WebCmd] %s = %.2f", param, value)
+        except Exception as e:
+            logger.debug("Error procesando web cmd: %s", e)
+            try: _CMD_PATH.unlink(missing_ok=True)
+            except Exception: pass
 
 
 # ─────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────
 
-def parse_args() -> argparse.Namespace:
+def main() -> None:
     p = argparse.ArgumentParser(
         description="Sistema Adaptativo de Recomendación Musical")
-    p.add_argument("--user",    default="estudiante", help="ID de usuario")
-    p.add_argument("--port",    default=SERIAL_PORT,  help="Puerto serial")
-    p.add_argument("--api-key", default=os.getenv("GROQ_API_KEY", ""),
-                   help="Groq API key (o env GROQ_API_KEY) — gratis en console.groq.com")
-    p.add_argument("--demo",    action="store_true",
-                   help="Modo simulación sin hardware")
-    p.add_argument("--calibrate", type=int, default=0, metavar="SEG",
-                   help="Segundos de calibración antes de iniciar")
-    return p.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
+    p.add_argument("--user",      default="estudiante")
+    p.add_argument("--port",      default=SERIAL_PORT)
+    p.add_argument("--api-key",   default=os.getenv("GROQ_API_KEY", ""),
+                   help="Groq API key — gratis en console.groq.com")
+    p.add_argument("--demo",      action="store_true",
+                   help="Modo simulación con panel interactivo")
+    p.add_argument("--calibrate", type=int, default=0, metavar="SEG")
+    args = p.parse_args()
 
     system = AdaptiveMusicSystem(
-        user_id    = args.user,
-        serial_port= args.port,
-        api_key    = args.api_key or None,
-        demo       = args.demo,
+        user_id    =args.user,
+        serial_port=args.port,
+        api_key    =args.api_key or None,
+        demo       =args.demo,
     )
 
     if args.calibrate > 0:

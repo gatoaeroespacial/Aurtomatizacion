@@ -90,14 +90,22 @@ RL_EPSILON_DECAY  = 0.995
 RL_REWARD_GOOD    = 0.15
 RL_PENALTY_BAD    = -0.08
 RL_REWARD_CLIP    = (-2.0, 2.0)
-RL_MIN_PLAY_SEC   = 45     # segundos mínimos antes de evaluar
-RL_EVAL_DELAY_SEC = 60     # espera tras cambio de canción
+RL_MIN_PLAY_SEC   = 15     # segundos mínimos antes de evaluar cambio
+RL_EVAL_DELAY_SEC = 20     # espera tras cambio de canción
+
+# ── Feedback musical → simulador (efecto de la música en la persona) ──
+# Velocidad con que la música "arrastra" los parámetros fisiológicos
+# hacia el estado objetivo. Solo activo en modo demo.
+# 0.0 = sin efecto, 1.0 = convergencia instantánea
+MUSIC_FEEDBACK_RATE  = 0.04   # por ventana procesada (suave y gradual)
+MUSIC_FEEDBACK_EVERY = 3      # aplicar cada N ventanas (no en todas)
 
 # ── LLM ───────────────────────────────────────────────────────
-LLM_MODEL         = "claude-sonnet-4-20250514"
+# Groq — API gratuita: https://console.groq.com/keys
+LLM_MODEL         = "llama-3.3-70b-versatile"   # o "mixtral-8x7b-32768"
 LLM_MAX_TOKENS    = 1000
-LLM_INSIGHT_EVERY = 10     # cada N ventanas procesadas
-LLM_ENDPOINT      = "https://api.anthropic.com/v1/messages"
+LLM_INSIGHT_EVERY = 10
+LLM_ENDPOINT      = "https://api.groq.com/openai/v1/chat/completions"
 
 # ── Señal / Filtros ───────────────────────────────────────────
 ECG_BANDPASS_LOW  = 0.5    # Hz
@@ -117,10 +125,20 @@ ARTIFACT_GSR_MAX    = 100.0  # µS — por encima = artefacto
 ARTIFACT_ECG_CLAMP  = (0.0, 5.0)  # V — rango válido ADC
 ARTIFACT_AIR_CLAMP  = (0.0, 5.0)
 
-# ── Dashboard ─────────────────────────────────────────────────
-DASH_UPDATE_MS    = 120    # intervalo de refresco matplotlib
-DASH_WINDOW_SEC   = 15     # ventana visible en gráficas
-DASH_METRIC_EVERY = 25     # frames entre actualizaciones de métricas
+# ── Dashboard ligero (texto) ─────────────────────────────────
+DASH_UPDATE_MS    = 500    # ms entre refresco del dashboard de texto
+DASH_WINDOW_SEC   = 15
+DASH_METRIC_EVERY = 25
+
+# ── Transiciones musicales con fade ──────────────────────────
+FADE_OUT_MS         = 1500  # ms fade out antes de cambiar
+FADE_IN_MS          = 800   # ms fade in al iniciar nueva
+FADE_STEPS          = 20    # pasos de volumen
+
+# ── Estabilidad de estado / hysteresis ───────────────────────
+STATE_STABILITY_COUNT  = 3    # ventanas consecutivas mismo estado para actuar
+STATE_CHANGE_CONF_MIN  = 0.55 # confianza mínima para cambio
+STATE_STABILITY_WINDOW = 8    # historial de ventanas para evaluar tendencia
 
 # ── Logging ───────────────────────────────────────────────────
 LOG_LEVEL = "INFO"
