@@ -97,8 +97,12 @@ RL_EVAL_DELAY_SEC = 20     # espera tras cambio de canción
 # Velocidad con que la música "arrastra" los parámetros fisiológicos
 # hacia el estado objetivo. Solo activo en modo demo.
 # 0.0 = sin efecto, 1.0 = convergencia instantánea
-MUSIC_FEEDBACK_RATE  = 0.04   # por ventana procesada (suave y gradual)
+MUSIC_FEEDBACK_RATE  = 0.02   # por ventana procesada (suave y gradual)
 MUSIC_FEEDBACK_EVERY = 3      # aplicar cada N ventanas (no en todas)
+
+# Simulación — transiciones fisiológicas
+SIM_LERP_SEC         = 12.0   # constante de tiempo objetivo→señal (s)
+SIM_MANUAL_LOCK_SEC  = 90.0   # pausa feedback musical tras ajuste manual
 
 # ── LLM ───────────────────────────────────────────────────────
 # Groq — API gratuita: https://console.groq.com/keys

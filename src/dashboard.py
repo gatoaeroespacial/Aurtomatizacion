@@ -115,13 +115,20 @@ class SystemState:
 # CONTROLADOR DE SIMULACIÓN — sliders en memoria
 # ─────────────────────────────────────────────────────────────
 
+SIM_PARAM_NAMES = (
+    "bpm_target", "resp_rate", "resp_reg", "gsr_scl",
+    "stress_level", "conc_level", "noise_level",
+)
+
+
 @dataclass
 class SimulationController:
     """
     Parámetros que el usuario controla desde el panel.
-    SerialReader._simulate_loop los lee para generar señales.
+    SerialReader._simulate_loop usa get_active() (interpolado).
+    Los atributos son objetivos; _active converge con tick().
     """
-    # Parámetros directos
+    # Objetivos (sliders / presets / feedback musical)
     bpm_target:   float = 70.0    # 35 – 180
     resp_rate:    float = 14.0    # 6  – 30
     resp_reg:     float = 0.8     # 0  – 1 (regularidad)
@@ -130,10 +137,16 @@ class SimulationController:
     conc_level:   float = 0.7     # 0  – 1 (nivel de concentración deseado)
     noise_level:  float = 0.1     # 0  – 1 (ruido en señales)
 
-    # Presets activos
     _preset: str = "custom"
     _lock:   threading.Lock = field(
         default_factory=threading.Lock, repr=False)
+    _active: dict = field(default_factory=dict, repr=False)
+    _manual_lock_until: float = field(default=0.0, repr=False)
+
+    def __post_init__(self) -> None:
+        with self._lock:
+            for p in SIM_PARAM_NAMES:
+                self._active[p] = float(getattr(self, p))
 
     PRESETS = {
         "alta_conc":  dict(bpm_target=68, resp_rate=13, resp_reg=0.9,
@@ -163,9 +176,11 @@ class SimulationController:
             for k, v in self.PRESETS[name].items():
                 setattr(self, k, v)
             self._preset = name
+            self._manual_lock_until = 0.0
         return True
 
     def get(self) -> dict:
+        """Objetivos actuales (para UI y state.json)."""
         with self._lock:
             return {
                 "bpm_target":   self.bpm_target,
@@ -178,7 +193,27 @@ class SimulationController:
                 "preset":       self._preset,
             }
 
+    def get_active(self) -> dict:
+        """Valores interpolados usados por el generador de señales."""
+        with self._lock:
+            return dict(self._active)
+
+    def tick(self, dt: float) -> None:
+        from config import SIM_LERP_SEC
+        alpha = min(1.0, max(0.0, dt) / max(SIM_LERP_SEC, 0.5))
+        with self._lock:
+            for p in SIM_PARAM_NAMES:
+                tgt = float(getattr(self, p))
+                cur = self._active.get(p, tgt)
+                self._active[p] = cur + alpha * (tgt - cur)
+
+    def is_manual_locked(self) -> bool:
+        import time as _time
+        return _time.time() < self._manual_lock_until
+
     def set_param(self, param: str, value: float) -> bool:
+        from config import SIM_MANUAL_LOCK_SEC
+        import time as _time
         limits = {
             "bpm_target":   (35, 180),
             "resp_rate":    (6, 30),
@@ -194,6 +229,7 @@ class SimulationController:
         with self._lock:
             setattr(self, param, float(max(lo, min(hi, value))))
             self._preset = "custom"
+            self._manual_lock_until = _time.time() + SIM_MANUAL_LOCK_SEC
         return True
 
 

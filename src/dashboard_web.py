@@ -7,7 +7,8 @@ Ejecutar:
 
 Requiere que main.py esté corriendo en otra terminal.
 Lee state.json (escrito por main.py cada ~10 s).
-Escribe sim_cmd.json para enviar comandos al simulador.
+Escribe sim_cmd.json para enviar comandos al simulador y al
+reproductor musical integrado.
 
 No duplica lógica del pipeline. Solo visualización + control.
 ================================================================
@@ -34,13 +35,11 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ── CSS mínimo ────────────────────────────────────────────────
+# ── CSS ────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* Tipografía base */
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
-/* Métricas más compactas */
 [data-testid="metric-container"] {
     background: #1e1e2e;
     border: 1px solid #313244;
@@ -52,7 +51,6 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
     font-size: 1.4rem; font-weight: 700;
 }
 
-/* Tarjetas de estado cognitivo */
 .state-card {
     padding: 12px 16px; border-radius: 10px;
     margin: 4px 0; font-weight: 600; font-size: 1rem;
@@ -64,13 +62,25 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 .state-estres{ background:#3a1a1a; border:2px solid #e05252; color:#e05252; }
 .state-none  { background:#2a2a2a; border:2px solid #555;    color:#aaa;    }
 
-/* Barra de progreso de buffer */
-.buf-bar {
-    height: 6px; border-radius: 3px;
-    background: linear-gradient(90deg, #7c3aed, #06b6d4);
+.player-card {
+    background: #1e1e2e;
+    border: 1px solid #313244;
+    border-radius: 12px;
+    padding: 18px 22px;
+    margin-bottom: 14px;
 }
+.player-track-category {
+    font-size: 0.72rem; color: #a6adc8;
+    letter-spacing: 0.06em; margin-bottom: 5px;
+}
+.player-track-name {
+    font-size: 1.05rem; font-weight: 600; color: #cdd6f4;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.player-status-playing { color: #40bf80; font-size: 0.75rem; margin-top: 8px; }
+.player-status-paused  { color: #e5c347; font-size: 0.75rem; margin-top: 8px; }
+.player-status-stopped { color: #888;    font-size: 0.75rem; margin-top: 8px; }
 
-/* Recuadro de eventos */
 .event-box {
     background: #1e1e2e; border: 1px solid #313244;
     border-radius: 8px; padding: 10px 14px;
@@ -79,17 +89,13 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
     font-family: monospace;
 }
 
-/* Insight LLM */
 .llm-box {
     background: #1e1e2e; border: 1px solid #7c3aed;
     border-radius: 8px; padding: 14px; color: #cba6f7;
     font-size: 0.85rem; line-height: 1.5;
 }
 
-/* Divider */
 hr { border-color: #313244; margin: 10px 0; }
-
-/* Ocultar menú hamburguesa */
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
 </style>
@@ -100,9 +106,8 @@ footer {visibility: hidden;}
 # UTILIDADES
 # ─────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=0.4)   # refresca cada 400 ms
+@st.cache_data(ttl=0.4)
 def _load_state() -> dict:
-    """Lee state.json. Retorna dict vacío si no existe."""
     if not STATE_PATH.exists():
         return {}
     try:
@@ -113,7 +118,6 @@ def _load_state() -> dict:
 
 
 def _send_cmd(cmd: dict) -> None:
-    """Escribe sim_cmd.json para que main.py lo procese."""
     cmd["ts"] = time.time()
     try:
         with open(CMD_PATH, "w", encoding="utf-8") as f:
@@ -141,7 +145,7 @@ def _state_emoji(state: str) -> str:
 
 
 def _fmt_time(secs: float) -> str:
-    m, s = divmod(int(secs), 60)
+    m, s = divmod(int(max(0, secs)), 60)
     return f"{m}:{s:02d}"
 
 
@@ -149,6 +153,194 @@ def _quality_color(q: float) -> str:
     if q >= 0.8: return "#40bf80"
     if q >= 0.5: return "#e5c347"
     return "#e05252"
+
+
+# ─────────────────────────────────────────────────────────────
+# REPRODUCTOR INTEGRADO
+# ─────────────────────────────────────────────────────────────
+
+def _render_player(s: dict) -> None:
+    """
+    Reproductor musical integrado con el MusicEngine real.
+    Lee estado desde state.json y envía comandos via sim_cmd.json.
+    No crea reproductores paralelos — controla el AudioPlayer existente.
+
+    Comportamiento de cada control:
+      Play    → resume si estaba pausado, o inicia en la categoría actual
+      Pause   → pausa sin perder posición
+      Stop    → detiene completamente
+      Siguiente → cambia dentro de la MISMA categoría activa
+      Volumen → ajuste en tiempo real sobre el mixer de pygame
+    """
+    st.markdown("### 🎵 Reproductor Musical")
+
+    track_name   = s.get("track_name", "—")
+    track_state  = s.get("track_state", "—")
+    secs_played  = float(s.get("seconds_played", 0.0))
+    duration     = s.get("current_track_duration")    # None si librosa no disponible
+    is_playing   = bool(s.get("player_is_playing", False))
+    is_paused    = bool(s.get("player_is_paused", False))
+    user_stopped = bool(s.get("player_user_stopped", False))
+    volume       = float(s.get("player_volume", 0.8))
+    cog_state    = s.get("cog_state", "—")
+
+    FOLDER_LABELS = {
+        "focus":        "🎯 Focus",
+        "calm":         "🌊 Calm",
+        "energize":     "⚡ Energize",
+        "stress_relief":"🍃 Stress Relief",
+        # aliases por si track_state viene como estado cognitivo
+        "alta_conc":    "🎯 Focus",
+        "media_conc":   "🌊 Calm",
+        "baja_conc":    "⚡ Energize",
+        "estres":       "🍃 Stress Relief",
+    }
+    COG_LABELS = {
+        "alta_conc":  "🟢 Alta conc.",
+        "media_conc": "🟡 Media conc.",
+        "baja_conc":  "🔵 Baja conc.",
+        "estres":     "🔴 Estrés",
+    }
+
+    folder_label = FOLDER_LABELS.get(track_state, track_state)
+    cog_label    = COG_LABELS.get(cog_state, cog_state)
+    no_track     = (track_name in ("—", "", None))
+
+    # ── Tarjeta de pista actual ───────────────────────────────
+    track_display = f"🎵 {track_name}" if not no_track else "⏹ Sin reproducción activa"
+    st.markdown(
+        f"""
+        <div class="player-card">
+            <div class="player-track-category">
+                {folder_label} &nbsp;·&nbsp; Estado cognitivo: {cog_label}
+            </div>
+            <div class="player-track-name">{track_display}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── Barra de progreso + tiempos ───────────────────────────
+    if duration and duration > 0 and not no_track:
+        progress_pct = min(1.0, secs_played / duration)
+        st.progress(progress_pct)
+        t1, t2 = st.columns([1, 1])
+        t1.markdown(
+            f"<span style='font-size:0.8rem;color:#a6adc8'>"
+            f"{_fmt_time(secs_played)}</span>",
+            unsafe_allow_html=True)
+        t2.markdown(
+            f"<span style='font-size:0.8rem;color:#a6adc8;float:right'>"
+            f"{_fmt_time(duration)}</span>",
+            unsafe_allow_html=True)
+    elif not no_track:
+        # Sin duración conocida: mostrar solo tiempo transcurrido
+        st.progress(0.0)
+        st.markdown(
+            f"<span style='font-size:0.8rem;color:#a6adc8'>"
+            f"{_fmt_time(secs_played)} &nbsp;(duración desconocida — "
+            f"instala librosa para detectarla)</span>",
+            unsafe_allow_html=True)
+    else:
+        st.progress(0.0)
+
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+    # ── Botones de control ────────────────────────────────────
+    c_play, c_pause, c_stop, c_next = st.columns(4)
+
+    can_pause = is_playing and not is_paused
+    can_resume = is_paused and not no_track
+    can_play = user_stopped or (no_track and not is_playing) or can_resume
+
+    if is_playing and not is_paused:
+        play_label, play_disabled = "▶ Reproduciendo", True
+    elif can_resume:
+        play_label, play_disabled = "▶ Reanudar", False
+    else:
+        play_label, play_disabled = "▶ Play", not can_play
+
+    if c_play.button(play_label, key="btn_player_play",
+                     use_container_width=True, disabled=play_disabled):
+        _send_cmd({"action": "player_play"})
+        st.toast("Iniciando reproducción...", icon="▶️")
+
+    if c_pause.button("⏸ Pause", key="btn_player_pause",
+                      use_container_width=True,
+                      disabled=no_track or not can_pause):
+        _send_cmd({"action": "player_pause"})
+        st.toast("Pausado", icon="⏸️")
+
+    if c_stop.button("⏹ Stop", key="btn_player_stop",
+                     use_container_width=True,
+                     disabled=no_track and not is_playing and not is_paused):
+        _send_cmd({"action": "player_stop"})
+        st.toast("Reproducción detenida", icon="⏹️")
+
+    next_help = (
+        f"Cambia a otra canción dentro de [{folder_label}] "
+        f"(misma carpeta MP3)."
+    )
+    if c_next.button("⏭ Siguiente", key="btn_player_next",
+                     use_container_width=True,
+                     disabled=no_track,
+                     help=next_help):
+        _send_cmd({"action": "player_next"})
+        st.toast(f"Siguiente en {folder_label}...", icon="⏭️")
+
+    # ── Control de volumen ─────────────────────────────────────
+    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+
+    v1, v2 = st.columns([1, 5])
+    v1.markdown(
+        "<span style='font-size:0.85rem;color:#a6adc8;"
+        "line-height:38px;display:inline-block'>🔊 Vol</span>",
+        unsafe_allow_html=True)
+
+    vol_key  = "player_volume_slider"
+    vol_lock = "_volume_user_lock"
+
+    if vol_key not in st.session_state:
+        st.session_state[vol_key] = volume
+    if vol_lock not in st.session_state:
+        st.session_state[vol_lock] = False
+    if not st.session_state[vol_lock]:
+        if abs(st.session_state[vol_key] - volume) > 0.04:
+            st.session_state[vol_key] = volume
+
+    def _on_volume_change() -> None:
+        st.session_state[vol_lock] = True
+        _send_cmd({
+            "action": "player_volume",
+            "value": round(float(st.session_state[vol_key]), 2),
+        })
+
+    v2.slider(
+        "Volumen",
+        min_value=0.0, max_value=1.0,
+        step=0.05,
+        key=vol_key,
+        label_visibility="collapsed",
+        on_change=_on_volume_change,
+    )
+
+    # ── Indicador de estado ───────────────────────────────────
+    if is_playing:
+        status_css   = "player-status-playing"
+        status_label = "● Reproduciendo"
+    elif is_paused:
+        status_css   = "player-status-paused"
+        status_label = "● Pausado"
+    elif user_stopped:
+        status_css   = "player-status-stopped"
+        status_label = "● Detenido (usuario)"
+    else:
+        status_css   = "player-status-stopped"
+        status_label = "● Detenido"
+
+    st.markdown(
+        f"<p class='{status_css}'>{status_label}</p>",
+        unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -182,7 +374,6 @@ def render() -> None:
                 "que `main.py` exporte `state.json`.")
         st.stop()
 
-    # Buffer progress
     buf = s.get("buffer_pct", 0)
     if buf < 100:
         st.markdown(
@@ -198,20 +389,20 @@ def render() -> None:
 
     # ── FILA 1: Fisiología + Estado cognitivo ─────────────────
     col_fisio, col_cog = st.columns([3, 2])
-
     with col_fisio:
         _render_physio(s)
-
     with col_cog:
         _render_cognitive(s)
 
     st.markdown("---")
 
-    # ── FILA 2: Motor musical + LLM ───────────────────────────
+    # ── FILA 2: Reproductor + LLM ─────────────────────────────
     col_music, col_llm = st.columns([3, 2])
 
     with col_music:
-        _render_music(s)
+        _render_player(s)          # Reproductor integrado (nuevo)
+        st.markdown("---")
+        _render_music(s)           # Métricas RL existentes (sin cambios)
 
     with col_llm:
         _render_llm(s)
@@ -228,7 +419,6 @@ def render() -> None:
     else:
         _render_history(s)
 
-    # ── Auto-refresco ─────────────────────────────────────────
     ts = s.get("ts", 0)
     age = time.time() - ts if ts else 999
     age_color = "#40bf80" if age < 15 else "#e5c347" if age < 30 else "#e05252"
@@ -237,13 +427,12 @@ def render() -> None:
         f"Último dato: {age:.1f}s atrás</p>",
         unsafe_allow_html=True)
 
-    # Refresco automático cada 1 s
     time.sleep(1)
     st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────
-# PANELES
+# PANELES (sin cambios respecto al original)
 # ─────────────────────────────────────────────────────────────
 
 def _render_physio(s: dict) -> None:
@@ -260,19 +449,15 @@ def _render_physio(s: dict) -> None:
     scr  = s.get("scr_count", 0)
     q    = s.get("signal_quality", 0)
 
-    # Fila 1: ECG
     c1, c2, c3, c4, c5 = st.columns(5)
     bpm_delta  = "✅" if 58 <= bpm <= 80 else ("⚠️" if bpm > 0 else "—")
     rmss_delta = "✅" if rmssd >= 30 else ("⚠️" if rmssd > 0 else "—")
-    c1.metric("❤️ BPM",        f"{bpm:.1f}",   delta=bpm_delta,
-              delta_color="off")
-    c2.metric("📊 RMSSD †",    f"{rmssd:.1f} ms", delta=rmss_delta,
-              delta_color="off")
+    c1.metric("❤️ BPM",        f"{bpm:.1f}",   delta=bpm_delta,  delta_color="off")
+    c2.metric("📊 RMSSD †",    f"{rmssd:.1f} ms", delta=rmss_delta, delta_color="off")
     c3.metric("📈 SDNN †",     f"{sdnn:.1f} ms")
     c4.metric("🔢 NN50",       f"{nn50}")
     c5.metric("📉 pNN50",      f"{pnn50:.1f}%")
 
-    # Fila 2: Resp + GSR
     c1, c2, c3, c4 = st.columns(4)
     resp_ok = "✅" if 10 <= resp <= 16 else ("⚠️" if resp > 0 else "—")
     scl_ok  = "✅" if 2 <= scl <= 8  else ("⚠️" if scl > 0  else "—")
@@ -282,7 +467,6 @@ def _render_physio(s: dict) -> None:
     c3.metric("⚡ GSR/SCL",    f"{scl:.2f} µS", delta=scl_ok, delta_color="off")
     c4.metric("🌊 SCR",        f"{scr}")
 
-    # Calidad de señal
     qpct = q * 100
     qcolor = _quality_color(q)
     st.markdown(
@@ -290,7 +474,6 @@ def _render_physio(s: dict) -> None:
         f"<span style='color:{qcolor};font-weight:700'>{qpct:.0f}%</span>",
         unsafe_allow_html=True)
     st.progress(q)
-
     st.caption("† RMSSD/SDNN a 50 Hz son indicadores de tendencia, "
                "no valores clínicos (resolución ±20 ms)")
 
@@ -333,7 +516,7 @@ def _render_cognitive(s: dict) -> None:
 
 
 def _render_music(s: dict) -> None:
-    st.markdown("### 🎵 Motor Musical")
+    st.markdown("### 📊 Métricas del Motor RL")
 
     track   = s.get("track_name", "—")
     cat     = s.get("track_state", "—")
@@ -346,30 +529,22 @@ def _render_music(s: dict) -> None:
     epsilon = s.get("epsilon", 0.15)
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("🎶 Pista actual", track[:28] if track else "—")
-    c2.metric("📁 Categoría",    cat)
-    c3.metric("⏱️ Tiempo",       _fmt_time(secs))
-
-    c1, c2, c3 = st.columns(3)
-    score_color = "#40bf80" if score > 0 else "#e05252"
     c1.metric("📊 Score RL",     f"{score:+.3f}")
     c2.metric("💰 Reward acum.", f"{rsum:+.3f}")
     c3.metric("🔁 Reproducc.",   f"{plays}")
 
     if last_rw is not None:
-        rw_delta = f"+{last_rw:.3f}" if last_rw >= 0 else f"{last_rw:.3f}"
         rw_color = "#40bf80" if last_rw >= 0 else "#e05252"
         st.markdown(
             f"**Último reward:** "
-            f"<span style='color:{rw_color};font-weight:700'>{rw_delta}</span>",
+            f"<span style='color:{rw_color};font-weight:700'>{last_rw:+.3f}</span>",
             unsafe_allow_html=True)
 
     st.markdown(f"**ε (exploración):** {epsilon:.3f}")
 
-    with st.expander("🔍 Motivo del último cambio", expanded=True):
+    with st.expander("🔍 Motivo del último cambio", expanded=False):
         st.markdown(f"> {reason}")
 
-    # Historial de eventos
     events = s.get("music_events", [])
     if events:
         st.markdown("**Historial de eventos:**")
@@ -401,10 +576,25 @@ def _render_llm(s: dict) -> None:
         unsafe_allow_html=True)
 
 
+_SIM_LOCK_KEY = "_sim_sliders_user_lock"
+
+
+def _on_sim_param_change(param: str) -> None:
+    st.session_state[_SIM_LOCK_KEY] = True
+    sk = f"slider_{param}"
+    _send_cmd({
+        "action": "set_param",
+        "param": param,
+        "value": float(st.session_state[sk]),
+    })
+
+
 def _render_simulation(s: dict) -> None:
     st.markdown("### 🎛️ Panel de Simulación")
 
-    # ── Presets ───────────────────────────────────────────────
+    if _SIM_LOCK_KEY not in st.session_state:
+        st.session_state[_SIM_LOCK_KEY] = False
+
     st.markdown("**Presets rápidos:**")
     presets = {
         "🟢 Alta conc.":  "alta_conc",
@@ -415,18 +605,17 @@ def _render_simulation(s: dict) -> None:
         "😌 Relajación":  "relajacion",
     }
 
-    # 3 columnas de botones
     btn_items = list(presets.items())
     for row_start in range(0, len(btn_items), 3):
         cols = st.columns(3)
         for i, (label, key) in enumerate(btn_items[row_start:row_start+3]):
             if cols[i].button(label, key=f"preset_{key}", use_container_width=True):
                 _send_cmd({"action": "preset", "preset": key})
+                st.session_state[_SIM_LOCK_KEY] = False
                 st.toast(f"Preset aplicado: {label}", icon="✅")
 
     st.markdown("---")
 
-    # ── Sliders individuales ───────────────────────────────────
     st.markdown("**Ajuste fino:**")
 
     PARAMS = [
@@ -439,62 +628,36 @@ def _render_simulation(s: dict) -> None:
         ("noise_level",  "📡 Ruido de señal",          0.0,   1.0,  0.02),
     ]
 
-    # Valores actuales (del state.json si main.py los exporta,
-    # o defaults del SimulationController)
     sim_params = s.get("sim_params", {})
 
-    # ── Sincronizar session_state con valores del JSON ─────────
-    # Cuando el feedback loop mueve un parámetro en main.py, el JSON
-    # lo exporta y aquí actualizamos el session_state para que el
-    # slider refleje el valor real. Solo actualizamos si el usuario
-    # NO está arrastrando (flag _user_dragging_<param>).
     for param, _, lo, hi, step in PARAMS:
+        sk = f"slider_{param}"
         json_val = float(sim_params.get(param, (lo + hi) / 2))
-        sk       = f"slider_{param}"
-        drag_sk  = f"_drag_{param}"
-        # Si no hay valor en session_state o el feedback lo cambió
-        # y el usuario no está interactuando → sincronizar
         if sk not in st.session_state:
             st.session_state[sk] = json_val
-        elif not st.session_state.get(drag_sk, False):
-            # Actualizar solo si difiere en más de 1 step (evita jitter)
-            if abs(st.session_state[sk] - json_val) > step:
+        elif not st.session_state[_SIM_LOCK_KEY]:
+            if abs(st.session_state[sk] - json_val) > step * 0.5:
                 st.session_state[sk] = json_val
 
-    # ── Renderizar sliders ────────────────────────────────────
     for param, label, lo, hi, step in PARAMS:
-        sk      = f"slider_{param}"
-        drag_sk = f"_drag_{param}"
-        prev_val = st.session_state.get(sk, float((lo + hi) / 2))
-
-        val = st.slider(
+        sk = f"slider_{param}"
+        st.slider(
             label,
-            min_value=float(lo),
-            max_value=float(hi),
-            value=float(prev_val),
+            min_value=float(lo), max_value=float(hi),
             step=float(step),
             key=sk,
+            on_change=_on_sim_param_change,
+            args=(param,),
         )
 
-        # Detectar movimiento manual del slider
-        user_moved = abs(val - prev_val) > step * 0.05
-        st.session_state[drag_sk] = user_moved
-
-        if user_moved:
-            _send_cmd({"action": "set_param", "param": param, "value": val})
-
-    # Indicador visual del feedback loop
     track_folder = s.get("track_state", "—")
     if sim_params:
         preset = sim_params.get("preset", "custom")
+        lock_note = " (ajuste manual activo)" if st.session_state[_SIM_LOCK_KEY] else ""
         st.caption(
-            f"🎵 Música activa: **{track_folder}** | "
-            f"Preset: `{preset}` | "
-            f"Los sliders se mueven solos a medida que la música "
-            f"ajusta los parámetros fisiológicos simulados."
+            f"🎵 Música: **{track_folder}** | Preset: `{preset}`{lock_note}. "
+            f"Objetivos convergen en ~12 s; métricas mostradas son calculadas."
         )
-    else:
-        st.caption("Los cambios se aplican en el próximo ciclo de main.py (~1 s)")
 
 
 def _render_history(s: dict) -> None:
@@ -509,7 +672,6 @@ def _render_history(s: dict) -> None:
     if df.empty:
         return
 
-    # ── Distribución de estados ───────────────────────────────
     st.markdown("**Distribución de estados (sesión actual):**")
     state_counts = df["state"].value_counts()
     total = len(df)
@@ -541,11 +703,8 @@ def _render_history(s: dict) -> None:
             unsafe_allow_html=True)
 
     st.markdown("---")
-
-    # ── Tendencias fisiológicas de la sesión ──────────────────
     st.markdown("**Tendencias de la sesión:**")
 
-    # Estadísticas descriptivas
     cols = st.columns(4)
     for col, (metric, label, unit) in zip(cols, [
         ("bpm",   "BPM promedio",  "bpm"),
@@ -560,25 +719,19 @@ def _render_history(s: dict) -> None:
                        delta=f"±{std:.1f}" if std > 0 else None,
                        delta_color="off")
 
-    # ── Comparativa con umbrales de la literatura ─────────────
     st.markdown("**Comparativa con umbrales teóricos (literatura):**")
 
     THRESHOLDS = [
-        ("bpm",   "BPM",         58,  80,  "bpm",
-         "Nourbakhsh 2012 + Task Force 1996"),
-        ("rmssd", "RMSSD",       30,  None, "ms",
-         "Task Force ESC/NASPE 1996 (>30 ms = tono vagal saludable)"),
-        ("scl",   "GSR/SCL",     2.0, 8.0, "µS",
-         "Nourbakhsh et al. 2012 (2–8 µS = zona óptima)"),
-        ("resp",  "Respiración", 10,  16,  "rpm",
-         "Critchley & Garfinkel 2017 (10–16 rpm = óptimo cognitivo)"),
+        ("bpm",   "BPM",         58,  80,  "bpm",  "Nourbakhsh 2012 + Task Force 1996"),
+        ("rmssd", "RMSSD",       30,  None,"ms",   "Task Force ESC/NASPE 1996 (>30 ms)"),
+        ("scl",   "GSR/SCL",     2.0, 8.0, "µS",   "Nourbakhsh et al. 2012 (2–8 µS)"),
+        ("resp",  "Respiración", 10,  16,  "rpm",  "Critchley & Garfinkel 2017 (10–16 rpm)"),
     ]
 
     for metric, name, lo, hi, unit, ref in THRESHOLDS:
         if metric not in df.columns:
             continue
-        val  = df[metric].mean()
-        rows = []
+        val = df[metric].mean()
         if lo is not None and val < lo:
             status = f"⬇️ Por debajo del óptimo ({lo} {unit})"
             color  = "#4d9de0"
@@ -598,11 +751,9 @@ def _render_history(s: dict) -> None:
             f"<span style='color:#666;font-size:0.72rem'>{ref}</span>",
             unsafe_allow_html=True)
 
-    # ── Tiempo en cada estado ─────────────────────────────────
     st.markdown("---")
     st.markdown("**Tiempo aproximado en cada estado:**")
 
-    # Asumir 1 registro ≈ 5 s (ventana de 5 s step)
     WINDOW_STEP_SEC = 5
     time_per_state = {
         st_key: count * WINDOW_STEP_SEC

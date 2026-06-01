@@ -153,6 +153,9 @@ class MusicLibrary:
     def get_tracks_for_state(self, state: str) -> List[str]:
         return self._by_state.get(state, [])
 
+    def get_tracks_in_folder(self, folder: str) -> List[str]:
+        return [tid for tid, tr in self._tracks.items() if tr.folder == folder]
+
     def get_track(self, tid: str) -> Optional[Track]:
         return self._tracks.get(tid)
 
@@ -312,24 +315,28 @@ class AudioPlayer:
         with self._lock:
             self._current_path = None
             self._started_at   = None
+            self._paused       = False
 
     def pause(self) -> None:
-        if PYGAME_OK and not self._paused:
-            with self._play_lock:
-                try:
+        if not PYGAME_OK or self._paused:
+            return
+        with self._play_lock:
+            try:
+                if pygame.mixer.music.get_busy():
                     pygame.mixer.music.pause()
-                    self._paused = True
-                except Exception:
-                    pass
+                self._paused = True
+            except Exception:
+                pass
 
     def resume(self) -> None:
-        if PYGAME_OK and self._paused:
-            with self._play_lock:
-                try:
-                    pygame.mixer.music.unpause()
-                    self._paused = False
-                except Exception:
-                    pass
+        if not PYGAME_OK or not self._paused:
+            return
+        with self._play_lock:
+            try:
+                pygame.mixer.music.unpause()
+                self._paused = False
+            except Exception:
+                pass
 
     def set_volume(self, vol: float) -> None:
         self._volume = float(np.clip(vol, 0.0, 1.0))
@@ -340,13 +347,21 @@ class AudioPlayer:
                 except Exception:
                     pass
 
+    def is_paused(self) -> bool:
+        return self._paused
+
     def is_playing(self) -> bool:
+        """True si el mixer está activo (incluye pausa en algunos SO)."""
         if not PYGAME_OK:
-            return self._current_path is not None
+            return self._current_path is not None and not self._paused
         try:
             return bool(pygame.mixer.music.get_busy())
         except Exception:
             return False
+
+    def is_audible(self) -> bool:
+        """True solo si hay audio sonando (no pausado)."""
+        return self.is_playing() and not self._paused
 
     def seconds_played(self) -> float:
         with self._lock:
@@ -522,6 +537,7 @@ class MusicEngine:
         self.last_event:         Optional[PlaybackEvent] = None
 
         self._change_time: float = 0.0
+        self._user_stopped: bool = False
 
         n = self._library.index()
         logger.info("[Music] Engine listo: %d pistas, usuario='%s'",
@@ -535,6 +551,9 @@ class MusicEngine:
         Aplica hysteresis, evalúa si cambiar, actúa con fade.
         """
         now = time.time()
+
+        if self._user_stopped:
+            return self._current_tid
 
         # 1. Estabilizar estado
         stable_state, state_changed = self._stable.update(raw_state, confidence)
@@ -554,8 +573,10 @@ class MusicEngine:
                 logger.info("[Music] Mantiene canción: %s", reason)
                 self.last_change_reason = reason
 
-        # 4. Canción terminó naturalmente
-        elif not self._player.is_playing() and self._current_tid is not None:
+        # 4. Canción terminó naturalmente (no pausa ni stop del usuario)
+        elif (self._current_tid is not None
+              and not self._player.is_paused()
+              and not self._player.is_audible()):
             self._do_change(
                 self._stable.get_trend(), now,
                 reason="Canción terminada → siguiente por RL")
@@ -590,15 +611,69 @@ class MusicEngine:
         return reward
 
     def force_change(self, state: Optional[str] = None) -> Optional[str]:
+        self._user_stopped = False
         state = state or self._current_state or "media_conc"
         self._do_change(state, time.time(), reason="Cambio manual forzado")
         return self._current_tid
 
-    def pause(self):  self._player.pause()
-    def resume(self): self._player.resume()
-    def stop(self):
+    def next_track_same_folder(self) -> Optional[str]:
+        """Siguiente pista en la misma carpeta física (focus/calm/...)."""
+        self._user_stopped = False
+        track = self.get_current_track()
+        now = time.time()
+        if not track:
+            return self.force_change(self._current_state or "media_conc")
+
+        candidates = self._library.get_tracks_in_folder(track.folder)
+        if not candidates:
+            return self._current_tid
+
+        new_tid = self._rl.select(candidates, self._current_tid)
+        new_track = self._library.get_track(new_tid)
+        if not new_track:
+            return self._current_tid
+
+        state = self._current_state or track.state
+        if self._current_tid and self._current_state:
+            ev = PlaybackEvent(
+                track_id=self._current_tid,
+                track_name=track.name,
+                state_at_start=self._current_state,
+                state_at_end=state,
+                started_at=self._change_time,
+                duration_played=self._player.seconds_played(),
+                change_reason="Siguiente manual (misma carpeta)",
+            )
+            self._event_history.append(ev)
+            self.last_event = ev
+
+        fade = self._current_tid is not None
+        self._player.play(new_track.path, fade=fade)
+        self._current_tid = new_tid
+        self._change_time = now
+        self.last_change_reason = f"Siguiente en {track.folder}"
+        logger.info("[Music] ⏭ [%s] %s", track.folder, new_track.name)
+        return self._current_tid
+
+    @property
+    def user_stopped(self) -> bool:
+        return self._user_stopped
+
+    def clear_user_stop(self) -> None:
+        self._user_stopped = False
+
+    def pause(self):
+        self._player.pause()
+
+    def resume(self):
+        self._user_stopped = False
+        self._player.resume()
+
+    def stop(self, user_initiated: bool = False):
         self._player.stop()
         self._current_tid = None
+        if user_initiated:
+            self._user_stopped = True
     def set_volume(self, v: float): self._player.set_volume(v)
     def reindex(self) -> int: return self._library.index()
     def seconds_played(self) -> float: return self._player.seconds_played()

@@ -59,8 +59,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("main")
-# En modo interactivo el dashboard ocupa la terminal — log va solo a archivo
-# Para depuración agrega StreamHandler aquí si necesitas.
 
 from signal_processor import SignalProcessor, RawSample
 from classifier import CognitiveClassifier, ClassificationResult
@@ -74,12 +72,6 @@ from dashboard import Dashboard, SystemState, SimulationController
 # ─────────────────────────────────────────────────────────────
 
 class SerialReader:
-    """
-    Lee muestras del Arduino o las genera sintéticamente.
-    En modo simulación, el SimulationController dicta los parámetros
-    en tiempo real — sin editar código.
-    """
-
     def __init__(self, port: str, baud: int,
                  sim_ctrl: Optional[SimulationController] = None):
         self._port    = port
@@ -93,7 +85,6 @@ class SerialReader:
 
     def start(self) -> bool:
         if self._sim is None:
-            # Intentar conexión real
             try:
                 import serial
                 self._ser = serial.Serial(
@@ -104,9 +95,10 @@ class SerialReader:
             except Exception as e:
                 logger.warning("Serial no disponible (%s) — SIMULACIÓN", e)
                 self._ok  = False
-                self._sim = SimulationController()  # fallback
+                self._sim = SimulationController()
 
         self._running = True
+        self._ecg_phase = 0.0
         target = self._read_loop if self._ok else self._simulate_loop
         threading.Thread(target=target, daemon=True,
                          name="serial-reader").start()
@@ -128,7 +120,6 @@ class SerialReader:
     def connected(self) -> bool:
         return self._ok
 
-    # ── Lectura real ──────────────────────────────────────────
     def _read_loop(self) -> None:
         while self._running:
             try:
@@ -159,13 +150,7 @@ class SerialReader:
         except ValueError:
             return None
 
-    # ── Simulación controlada ─────────────────────────────────
     def _simulate_loop(self) -> None:
-        """
-        Genera señales fisiológicas sintéticas a 50 Hz.
-        Todos los parámetros vienen del SimulationController —
-        el usuario los modifica desde el panel del dashboard.
-        """
         t      = 0.0
         ts_ms  = 0
         ivl    = 1.0 / SAMPLE_HZ
@@ -173,44 +158,45 @@ class SerialReader:
         while self._running:
             t     += ivl
             ts_ms  = int(t * 1000)
-            p      = self._sim.get()   # parámetros actuales
+            self._sim.tick(ivl)
+            p      = self._sim.get_active()
 
             bpm_t      = p["bpm_target"]
             resp_t     = p["resp_rate"]
             resp_reg   = p["resp_reg"]
             gsr_base   = p["gsr_scl"]
-            stress     = p["stress_level"]   # 0–1
-            noise      = p["noise_level"]    # 0–1
+            stress     = p["stress_level"]
+            noise      = p["noise_level"]
 
-            # ── GSR: stress eleva SCL y añade SCR ────────────
             gsr_cond = (gsr_base
-                        + stress * 6.0
-                        + 0.5 * np.sin(t * 0.03)
-                        + np.random.normal(0, noise * 0.5))
+                        + stress * 4.0
+                        + 0.35 * np.sin(t * 0.025)
+                        + np.random.normal(0, noise * 0.25))
             gsr_cond  = max(0.05, gsr_cond)
             gsr_res   = 1.0 / (gsr_cond * 1e-6)
             gsr_volt  = min(5.0, gsr_cond * 0.05)
 
-            # ── Airflow: freq = resp_rate, amp = regularidad ──
-            irreg  = (1 - resp_reg) * 0.15 * np.random.normal(0, 1)
+            irreg  = (1 - resp_reg) * 0.08 * np.random.normal(0, 1)
             air_volt = (2.5
                         + 0.35 * np.sin(2 * np.pi * (resp_t / 60) * t + irreg)
-                        + np.random.normal(0, noise * 0.05))
+                        + np.random.normal(0, noise * 0.03))
             air_volt = float(np.clip(air_volt, 0.0, 5.0))
 
-            # ── ECG: BPM con variabilidad modulada por estrés ─
-            # Estrés alto → BPM sube, HRV baja (menos variabilidad)
-            bpm_now = bpm_t + stress * 20 + 3 * np.sin(t * 0.08)
-            hrv_amp  = max(0.01, 0.05 * (1 - stress * 0.7))
-            phase    = (t * bpm_now / 60) % 1.0
-            if phase < 0.03:
-                ecg_volt = 2.5 + 1.1 * np.exp(
-                    -((phase - 0.015) ** 2) / 0.0001)
-            elif phase < 0.10:
-                ecg_volt = 2.5 - 0.08 * np.sin(
-                    (phase - 0.03) * np.pi / 0.07)
+            # BPM efectivo con modulación HRV coherente (no ruido entre latidos)
+            bpm_eff = float(np.clip(
+                bpm_t + stress * 12.0 + 2.0 * np.sin(t * 0.05), 40.0, 120.0))
+            hrv_frac = max(0.0, min(0.12, 0.04 * (1.0 - stress * 0.65)))
+            self._ecg_phase += (bpm_eff / 60.0) * ivl * (
+                1.0 + hrv_frac * np.sin(2 * np.pi * self._ecg_phase))
+            phase = self._ecg_phase % 1.0
+            if phase < 0.018:
+                ecg_volt = 2.5 + 1.0 * np.exp(
+                    -((phase - 0.009) ** 2) / 0.00008)
+            elif phase < 0.12:
+                ecg_volt = 2.5 - 0.06 * np.sin(
+                    (phase - 0.018) * np.pi / 0.102)
             else:
-                ecg_volt = 2.5 + np.random.normal(0, hrv_amp)
+                ecg_volt = 2.5 + np.random.normal(0, noise * 0.008)
             ecg_volt = float(np.clip(ecg_volt, 0.0, 5.0))
 
             sample = RawSample(
@@ -284,16 +270,13 @@ class AdaptiveMusicSystem:
         self._demo    = demo
         self._running = False
 
-        # SimulationController: solo en modo demo
         self._sim_ctrl = SimulationController() if demo else None
 
-        # SerialReader — recibe sim_ctrl para controlar la simulación
         self._serial = SerialReader(
             serial_port if not demo else "DEMO",
             SERIAL_BAUD,
             sim_ctrl=self._sim_ctrl)
 
-        # Pipeline de procesamiento
         self._processor  = SignalProcessor()
         self._classifier = CognitiveClassifier(user_id)
         self._music      = MusicEngine(user_id)
@@ -303,25 +286,22 @@ class AdaptiveMusicSystem:
         if api_key:
             self._llm.configure(api_key)
 
-        # Estado compartido con el dashboard
         self._sys_state = SystemState(
             demo_mode=demo,
             llm_enabled=self._llm.enabled,
         )
 
-        # Dashboard
         self._dashboard = Dashboard(
             state=self._sys_state,
             sim_ctrl=self._sim_ctrl,
             refresh_ms=DASH_UPDATE_MS,
         )
 
-        # Variables de control
         self._current_state:  Optional[str] = None
         self._prev_state:     Optional[str] = None
         self._last_result:    Optional[ClassificationResult] = None
         self._windows_processed = 0
-        self._session_history: list = []   # para comparativa histórica
+        self._session_history: list = []
 
         self._load_baseline()
 
@@ -332,8 +312,6 @@ class AdaptiveMusicSystem:
 
     def start(self) -> None:
         self._running = True
-
-        # Limpiar pantalla y arrancar dashboard
         sys.stdout.write("\033[2J\033[H")
         sys.stdout.flush()
         self._dashboard.start()
@@ -368,41 +346,34 @@ class AdaptiveMusicSystem:
         while self._running:
             t0 = time.time()
 
-            # 1. Muestras del serial
             samples = self._serial.drain()
             for s in samples:
                 self._processor.add_sample(s)
 
-            # 2. Progreso del buffer
             buf_n = len(self._processor._ecg_buf)
             self._sys_state.update(
                 buffer_pct=min(100.0, buf_n / 1500 * 100))
 
-            # 3. Features
             features = self._processor.get_features()
             if features is None:
                 time.sleep(max(0, ivl - (time.time() - t0)))
                 continue
 
-            # 4. Clasificar
             result = self._classifier.classify(features)
             self._windows_processed += 1
             self._last_result = result
 
-            # 5. Detectar cambio de estado
             state_changed = (self._current_state is not None
                              and result.state != self._current_state)
             self._prev_state    = self._current_state
             self._current_state = result.state
 
-            # 6. Motor musical
             self._music.update(result.state, result.confidence)
             track      = self._music.get_current_track()
             track_ts   = self._music.get_current_ts()
             track_name = track.name if track else "—"
             track_score = self._music.get_current_score() or 0.0
 
-            # 7. Reward al cambiar estado
             if state_changed and self._prev_state:
                 reward = self._music.compute_and_apply_reward(
                     self._prev_state, result.state)
@@ -414,7 +385,6 @@ class AdaptiveMusicSystem:
                     lambda ps=self._prev_state, ns=result.state:
                         self._llm.on_state_change(ps, ns))
 
-            # Detectar cambio de canción
             if (self._music.last_event and
                     self._music.last_event.started_at !=
                     getattr(self, "_last_event_ts", 0)):
@@ -424,7 +394,6 @@ class AdaptiveMusicSystem:
                     f"🎵 {ev.track_name} → {ev.state_at_end or '?'} "
                     f"| {ev.change_reason[:50]}")
 
-            # 8. LLM asíncrono
             self._llm.update_context(result, track_name)
             if self._windows_processed % LLM_INSIGHT_EVERY == 0:
                 self._async_llm(self._llm.maybe_generate_insight)
@@ -433,7 +402,6 @@ class AdaptiveMusicSystem:
                     lambda r=result:
                         self._llm.request_label_validation(r))
 
-            # 9. Actualizar SystemState para el dashboard
             f = features
             self._sys_state.update(
                 bpm=f.bpm, rmssd=f.rmssd, sdnn=f.sdnn,
@@ -459,7 +427,6 @@ class AdaptiveMusicSystem:
                 llm_enabled=self._llm.enabled,
             )
 
-            # 10. Session log + historial
             self._session_log.log(result, track_name, track_score)
             f = features
             self._session_history.append({
@@ -477,16 +444,13 @@ class AdaptiveMusicSystem:
                 self._windows_processed, result.state, result.confidence,
                 f.bpm, f.rmssd, f.scl, f.resp_rate, track_name)
 
-            # 11. Exportar JSON para dashboard web (cada 2 ventanas)
             if self._windows_processed % 2 == 0:
                 self._export_state_json()
 
-            # 12. Feedback musical → simulador (solo demo, cada N ventanas)
             if (self._sim_ctrl is not None
                     and self._windows_processed % MUSIC_FEEDBACK_EVERY == 0):
                 self._apply_music_feedback()
 
-            # 13. Leer comandos del dashboard web (sim_cmd.json)
             self._process_web_commands()
 
             time.sleep(max(0, ivl - (time.time() - t0)))
@@ -558,17 +522,28 @@ class AdaptiveMusicSystem:
         """
         Escribe state.json (leído por dashboard_web.py).
         Escritura atómica: escribe en .tmp y luego renombra.
-        Incluye sim_params para que los sliders del dashboard
-        muestren siempre los valores actuales del SimulationController.
+        Incluye estado completo del reproductor para el widget web.
         """
         try:
             snap = self._sys_state.snapshot()
             snap["music_events"] = list(snap.get("music_events", []))
             snap["ts"] = time.time()
             snap["session_history"] = self._session_history[-50:]
-            # Parámetros actuales del simulador → sliders del dashboard
+
+            # Parámetros del simulador
             if self._sim_ctrl:
                 snap["sim_params"] = self._sim_ctrl.get()
+
+            # ── Estado del reproductor para el widget web ─────
+            snap["player_is_playing"]      = self._music._player.is_audible()
+            snap["player_is_paused"]       = self._music._player.is_paused()
+            snap["player_user_stopped"]    = self._music.user_stopped
+            snap["player_volume"]          = self._music._player.current_volume
+            track = self._music.get_current_track()
+            snap["current_track_duration"] = (
+                float(track.duration) if track and track.duration else None)
+            # ─────────────────────────────────────────────────
+
             tmp = _STATE_PATH.with_suffix(".tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(snap, f, default=str)
@@ -577,20 +552,7 @@ class AdaptiveMusicSystem:
             logger.debug("Error exportando state.json: %s", e)
 
     def _apply_music_feedback(self) -> None:
-        """
-        Feedback loop demo: la música activa arrastra gradualmente los
-        parámetros del SimulationController hacia el estado fisiológico
-        que en teoría produciría esa música en una persona real.
-
-        Categorías y sus objetivos (literatura científica):
-          focus        → BPM 68, resp 13, GSR 4 µS, estrés mínimo
-          calm         → BPM 72, resp 14, GSR 5 µS
-          energize     → BPM 82, resp 16, más activación
-          stress_relief→ BPM 63, resp 9, GSR 2.5 µS (desacelera todo)
-
-        En hardware real NO se llama — el cuerpo real reacciona solo.
-        """
-        if not self._sim_ctrl:
+        if not self._sim_ctrl or self._sim_ctrl.is_manual_locked():
             return
         track = self._music.get_current_track()
         if not track:
@@ -638,7 +600,6 @@ class AdaptiveMusicSystem:
             logger.debug("[Feedback] %s ajusta %s", folder, moved[:3])
 
     def _export_sim_json(self) -> None:
-        """Escribe sim_ctrl.json con los parámetros actuales de simulación."""
         if not self._sim_ctrl:
             return
         try:
@@ -652,14 +613,22 @@ class AdaptiveMusicSystem:
     def _process_web_commands(self) -> None:
         """
         Lee sim_cmd.json escrito por dashboard_web.py.
-        Formato: {"action": "preset"|"set_param",
-                   "preset": "estres",          ← si action=preset
-                   "param": "bpm_target",        ← si action=set_param
-                   "value": 95.0,
-                   "ts": 1234567890.0}
+
+        Comandos de simulación:
+          {"action": "preset",    "preset": "estres"}
+          {"action": "set_param", "param": "bpm_target", "value": 95.0}
+
+        Comandos del reproductor musical (nuevos):
+          {"action": "player_play"}
+          {"action": "player_pause"}
+          {"action": "player_resume"}
+          {"action": "player_stop"}
+          {"action": "player_next"}              — siguiente en MISMA categoría
+          {"action": "player_volume", "value": 0.8}
+
         Borra el archivo tras procesar para evitar re-ejecución.
         """
-        if not self._sim_ctrl or not _CMD_PATH.exists():
+        if not _CMD_PATH.exists():
             return
         try:
             with open(_CMD_PATH, encoding="utf-8") as f:
@@ -667,17 +636,73 @@ class AdaptiveMusicSystem:
             _CMD_PATH.unlink(missing_ok=True)
 
             action = cmd.get("action")
-            if action == "preset":
+
+            # ── Comandos de simulación (existentes) ───────────
+            if action == "preset" and self._sim_ctrl:
                 name = cmd.get("preset", "")
                 if self._sim_ctrl.apply_preset(name):
                     logger.info("[WebCmd] Preset aplicado: %s", name)
                     self._sys_state.add_music_event(
                         f"[Web] Preset → {name}")
-            elif action == "set_param":
+
+            elif action == "set_param" and self._sim_ctrl:
                 param = cmd.get("param", "")
                 value = float(cmd.get("value", 0))
                 if self._sim_ctrl.set_param(param, value):
                     logger.info("[WebCmd] %s = %.2f", param, value)
+
+            # ── Comandos del reproductor (nuevos) ─────────────
+            elif action == "player_play":
+                self._music.clear_user_stop()
+                if self._music._player.is_paused():
+                    self._music.resume()
+                    logger.info("[WebCmd] Player: resume")
+                    self._sys_state.add_music_event("[Web] ▶ Resume")
+                elif (self._music._player.current_path is not None
+                      and not self._music._player.is_audible()):
+                    self._music.resume()
+                    logger.info("[WebCmd] Player: resume (path)")
+                    self._sys_state.add_music_event("[Web] ▶ Resume")
+                else:
+                    state = self._current_state or "media_conc"
+                    self._music.force_change(state)
+                    logger.info("[WebCmd] Player: play → %s", state)
+                    self._sys_state.add_music_event(
+                        f"[Web] ▶ Play [{state}]")
+
+            elif action == "player_pause":
+                if self._music._player.is_audible():
+                    self._music.pause()
+                    logger.info("[WebCmd] Player: pause")
+                    self._sys_state.add_music_event("[Web] ⏸ Pause")
+
+            elif action == "player_resume":
+                self._music.clear_user_stop()
+                self._music.resume()
+                logger.info("[WebCmd] Player: resume")
+                self._sys_state.add_music_event("[Web] ▶ Resume")
+
+            elif action == "player_stop":
+                self._music.stop(user_initiated=True)
+                logger.info("[WebCmd] Player: stop")
+                self._sys_state.add_music_event("[Web] ⏹ Stop")
+
+            elif action == "player_next":
+                self._music.clear_user_stop()
+                self._music.next_track_same_folder()
+                track = self._music.get_current_track()
+                name = track.name if track else "?"
+                folder = track.folder if track else "?"
+                logger.info("[WebCmd] Player: next → %s [%s]", name, folder)
+                self._sys_state.add_music_event(
+                    f"[Web] ⏭ Next [{folder}] → {name}")
+
+            elif action == "player_volume":
+                vol = float(cmd.get("value", 0.8))
+                vol = max(0.0, min(1.0, vol))
+                self._music.set_volume(vol)
+                logger.info("[WebCmd] Player: volume = %.2f", vol)
+
         except Exception as e:
             logger.debug("Error procesando web cmd: %s", e)
             try: _CMD_PATH.unlink(missing_ok=True)
